@@ -22,6 +22,7 @@ let sessionId = null;
 let meetingTabId = null;
 let prospectEmail = '';
 let wsClient = new CopilotWSClient();
+let pendingStart = null;
 
 // Restore state on SW wake
 (async () => {
@@ -181,6 +182,8 @@ async function startCopilot(tabId, email) {
     if (!hasServerConsent) {
       await chrome.storage.local.remove(StorageKey.AUDIO_CONSENT);
     }
+    pendingStart = { tabId, email };
+    await chrome.storage.session.set({ [StorageKey.PENDING_START]: pendingStart });
     // Open consent page — user must allow before we capture
     await chrome.windows.create({
       url: chrome.runtime.getURL('src/permission/consent.html'),
@@ -189,7 +192,7 @@ async function startCopilot(tabId, email) {
       height: 520,
       focused: true,
     });
-    return; // User needs to retry after granting consent
+    return;
   }
 
   setState(CopilotState.CONNECTING);
@@ -267,6 +270,17 @@ onMessage({
   },
   [MessageType.UPDATE_PREFERENCES]: async (msg) => {
     return updatePreferences(msg.preferences || {});
+  },
+  [MessageType.AUDIO_CONSENT_GRANTED]: async () => {
+    const stored = await chrome.storage.session.get(StorageKey.PENDING_START);
+    const start = pendingStart || stored[StorageKey.PENDING_START];
+    pendingStart = null;
+    await chrome.storage.session.remove(StorageKey.PENDING_START);
+    if (start?.tabId && start?.email) {
+      await startCopilot(start.tabId, start.email);
+      return { resumed: true };
+    }
+    return { resumed: false };
   },
   [MessageType.MEETING_DETECTED]: (msg, sender) => {
     meetingTabId = sender?.tab?.id || msg.tabId;

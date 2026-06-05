@@ -49,6 +49,7 @@ export const MessageType = Object.freeze({
   LOGOUT: 'LOGOUT',
   GET_PREFERENCES: 'GET_PREFERENCES',
   UPDATE_PREFERENCES: 'UPDATE_PREFERENCES',
+  AUDIO_CONSENT_GRANTED: 'AUDIO_CONSENT_GRANTED',
   // SW → popup / content
   STATE_UPDATE: 'STATE_UPDATE',
   // SW → content
@@ -107,6 +108,7 @@ export const StorageKey = Object.freeze({
   SESSION_ID: 'sc_session_id',
   PROSPECT_EMAIL: 'sc_prospect_email',
   AUDIO_CONSENT: 'sc_audio_consent',
+  PENDING_START: 'sc_pending_start',
 });
 
 // Default API base

@@ -11,6 +11,7 @@ import {
   logout,
   refreshToken,
   checkAudioConsent,
+  recordAudioConsent,
   getPreferences,
   updatePreferences,
 } from '../lib/api-client.js';
@@ -272,6 +273,9 @@ onMessage({
     return updatePreferences(msg.preferences || {});
   },
   [MessageType.AUDIO_CONSENT_GRANTED]: async () => {
+    await recordAudioConsent();
+    await chrome.storage.local.set({ [StorageKey.AUDIO_CONSENT]: true });
+
     const stored = await chrome.storage.session.get(StorageKey.PENDING_START);
     const start = pendingStart || stored[StorageKey.PENDING_START];
     pendingStart = null;

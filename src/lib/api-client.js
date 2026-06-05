@@ -42,6 +42,16 @@ async function request(path, init = {}) {
   return response;
 }
 
+async function requestWithTimeout(path, init = {}, timeoutMs = 10_000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await request(path, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export class AuthError extends Error {
   constructor() { super('auth_expired'); this.name = 'AuthError'; }
 }
@@ -111,6 +121,12 @@ export async function checkAudioConsent() {
   if (!res.ok) return false;
   const data = await res.json().catch(() => ({}));
   return data.has_consent === true;
+}
+
+export async function recordAudioConsent() {
+  const res = await requestWithTimeout('/api/v1/auth/consent', { method: 'POST' });
+  if (!res.ok) throw new Error(`consent_failed_${res.status}`);
+  return res.json().catch(() => ({ ok: true }));
 }
 
 // --- Copilot Sessions ---

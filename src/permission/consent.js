@@ -1,39 +1,42 @@
-// Consent page — stores user's audio permission and records server-side.
+// Consent page — asks the service worker to record consent and resume pending start.
 
-import { MessageType, StorageKey, API_BASE_URL } from '../constants.js';
+import { MessageType } from '../constants.js';
 
-document.getElementById('allow-btn').addEventListener('click', async () => {
-  const allowBtn = document.getElementById('allow-btn');
+const allowBtn = document.getElementById('allow-btn');
+const denyBtn = document.getElementById('deny-btn');
+
+function setError(message) {
+  let el = document.getElementById('consent-error');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'consent-error';
+    el.style.cssText = 'margin-top:12px;color:#dc2626;font-size:12px;line-height:1.4;';
+    allowBtn.insertAdjacentElement('beforebegin', el);
+  }
+  el.textContent = message;
+}
+
+allowBtn.addEventListener('click', async () => {
   allowBtn.disabled = true;
+  denyBtn.disabled = true;
   allowBtn.textContent = 'Saving...';
 
-  // Record consent server-side
-  let recorded = false;
   try {
-    const got = await chrome.storage.local.get([StorageKey.AUTH_TOKEN, StorageKey.API_BASE_URL]);
-    const base = got[StorageKey.API_BASE_URL] || API_BASE_URL;
-    const token = got[StorageKey.AUTH_TOKEN];
-    if (token) {
-      const res = await fetch(`${base}/api/v1/auth/consent`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      recorded = res.ok;
+    const res = await chrome.runtime.sendMessage({ type: MessageType.AUDIO_CONSENT_GRANTED });
+    if (!res?.ok) {
+      throw new Error(res?.error || 'consent_failed');
     }
-  } catch { /* handled below */ }
-
-  if (!recorded) {
+    allowBtn.textContent = res.data?.resumed ? 'Starting...' : 'Saved';
+    window.close();
+  } catch (err) {
     allowBtn.disabled = false;
+    denyBtn.disabled = false;
     allowBtn.textContent = 'Allow Audio Capture';
-    alert('Could not record consent with the server. Please check your login/backend connection and try again.');
-    return;
+    const message = err instanceof Error ? err.message : String(err);
+    setError(`Could not record consent or resume the assistant. ${message}`);
   }
-
-  await chrome.storage.local.set({ [StorageKey.AUDIO_CONSENT]: true });
-  await chrome.runtime.sendMessage({ type: MessageType.AUDIO_CONSENT_GRANTED }).catch(() => {});
-  window.close();
 });
 
-document.getElementById('deny-btn').addEventListener('click', () => {
+denyBtn.addEventListener('click', () => {
   window.close();
 });

@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Sales Copilot",
+  "version": "0.1.0",
+  "description": "AI-powered real-time sales assistant for Google Meet. Get live nudges, objection handling, and conversation intelligence.",
+  "permissions": [
+    "tabCapture",
+    "activeTab",
+    "storage",
+    "offscreen",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://meet.google.com/*",
+    "http://localhost:*/*",
+    "https://test-api.meetminutes.in/*"
+  ],
+  "background": {
+    "service_worker": "src/background/service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_title": "Sales Copilot"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["src/content/meet-copilot.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/offscreen/offscreen.html", "public/audio-worklet.js", "src/permission/consent.html"],
+      "matches": ["https://meet.google.com/*"]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https://test-api.meetminutes.in wss://test-api.meetminutes.in ws://localhost:* wss://localhost:*"
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}

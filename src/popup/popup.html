@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { width: 340px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; color: #1a1a2e; background: #fff; }
+    .container { padding: 16px; }
+    h1 { font-size: 16px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+    h1 .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .dot-idle { background: #9ca3af; }
+    .dot-active { background: #10b981; animation: pulse 1.5s infinite; }
+    .dot-connecting { background: #f59e0b; animation: pulse 1s infinite; }
+    .dot-error { background: #ef4444; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+    /* Auth */
+    .auth-section { display: flex; flex-direction: column; gap: 10px; }
+    .auth-section input { padding: 8px 12px; border: 1px solid #e5e7eb; border-radius: 6px; font-size: 13px; }
+    .auth-section input:focus { outline: none; border-color: #6366f1; }
+    .auth-tabs { display: flex; gap: 0; margin-bottom: 8px; }
+    .auth-tabs button { flex: 1; padding: 6px; border: 1px solid #e5e7eb; background: #f9fafb; font-size: 12px; cursor: pointer; }
+    .auth-tabs button.active { background: #6366f1; color: #fff; border-color: #6366f1; }
+    .auth-tabs button:first-child { border-radius: 6px 0 0 6px; }
+    .auth-tabs button:last-child { border-radius: 0 6px 6px 0; }
+
+    /* Copilot panel */
+    .copilot-section { display: flex; flex-direction: column; gap: 10px; }
+    .user-row { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #6b7280; margin-bottom: 8px; }
+    .user-row a { color: #6366f1; cursor: pointer; text-decoration: none; }
+    label { font-size: 12px; font-weight: 500; color: #374151; }
+    input[type="email"] { width: 100%; padding: 8px 12px; border: 1px solid #e5e7eb; border-radius: 6px; font-size: 13px; }
+    input[type="email"]:focus { outline: none; border-color: #6366f1; }
+
+    .btn { padding: 10px 16px; border: none; border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer; width: 100%; }
+    .btn-primary { background: #6366f1; color: #fff; }
+    .btn-primary:hover { background: #4f46e5; }
+    .btn-primary:disabled { background: #a5b4fc; cursor: not-allowed; }
+    .btn-danger { background: #fee2e2; color: #dc2626; }
+    .btn-danger:hover { background: #fecaca; }
+
+    .status-bar { padding: 8px 12px; border-radius: 6px; font-size: 12px; text-align: center; }
+    .status-active { background: #ecfdf5; color: #065f46; }
+    .status-connecting { background: #fef3c7; color: #92400e; }
+    .status-error { background: #fee2e2; color: #991b1b; }
+
+    .error-msg { color: #dc2626; font-size: 12px; margin-top: 4px; }
+    .settings { border-top: 1px solid #f3f4f6; padding-top: 10px; margin-top: 4px; }
+    .settings summary { cursor: pointer; font-size: 12px; color: #4b5563; font-weight: 600; }
+    .pref-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; margin-top: 8px; }
+    .pref-grid label, .retention-row label { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 400; color: #374151; }
+    .retention-row { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+    .retention-row input[type="number"] { width: 72px; padding: 4px 6px; border: 1px solid #e5e7eb; border-radius: 4px; font-size: 12px; }
+    .save-status { font-size: 11px; color: #6b7280; margin-top: 6px; min-height: 14px; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1><span class="dot dot-idle" id="status-dot"></span> Sales Copilot</h1>
+
+    <!-- Auth Section (shown when logged out) -->
+    <div id="auth-section" class="auth-section">
+      <div class="auth-tabs">
+        <button id="tab-login" class="active">Login</button>
+        <button id="tab-register">Register</button>
+      </div>
+      <input type="email" id="auth-email" placeholder="Email" autocomplete="email">
+      <input type="text" id="auth-name" placeholder="Name" class="hidden" autocomplete="name">
+      <input type="password" id="auth-password" placeholder="Password" autocomplete="current-password">
+      <button class="btn btn-primary" id="auth-submit">Login</button>
+      <div class="error-msg hidden" id="auth-error"></div>
+    </div>
+
+    <!-- Copilot Section (shown when logged in) -->
+    <div id="copilot-section" class="copilot-section hidden">
+      <div class="user-row">
+        <span id="user-email"></span>
+        <a id="logout-link">Logout</a>
+      </div>
+
+      <!-- Idle state: prospect form -->
+      <div id="idle-panel">
+        <label for="prospect-email">Prospect Email</label>
+        <input type="email" id="prospect-email" placeholder="prospect@company.com">
+        <button class="btn btn-primary" id="start-btn" style="margin-top:10px">Start Sales Assistant</button>
+      </div>
+
+      <!-- Active state: status + stop -->
+      <div id="active-panel" class="hidden">
+        <div class="status-bar status-active" id="status-bar">AI Assistant Active</div>
+        <p style="font-size:12px;color:#6b7280;margin-top:8px;text-align:center" id="prospect-display"></p>
+        <button class="btn btn-danger" id="stop-btn" style="margin-top:10px">Stop Assistant</button>
+      </div>
+
+      <details class="settings" id="settings-panel">
+        <summary>Preferences</summary>
+        <div class="pref-grid" id="nudge-prefs"></div>
+        <div class="retention-row">
+          <label><input type="checkbox" id="store-transcripts"> Store transcripts</label>
+          <label><input type="checkbox" id="store-nudges"> Store nudges</label>
+          <label>Retention days <input type="number" min="0" max="3650" id="retention-days"></label>
+        </div>
+        <div class="save-status" id="prefs-status"></div>
+      </details>
+
+      <div class="error-msg hidden" id="copilot-error"></div>
+    </div>
+  </div>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

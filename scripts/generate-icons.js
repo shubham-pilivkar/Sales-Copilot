@@ -1,33 +1,65 @@
 /**
  * Generate extension icons (16, 48, 128px).
  * Run: node scripts/generate-icons.js
- * Requires: sharp (npm install sharp --save-dev)
- *
- * If sharp is unavailable, creates simple colored PNG placeholders.
+ * Creates simple colored PNG placeholders using built-in Node APIs.
  */
-const fs = require('fs');
-const path = require('path');
+import fs from 'fs';
+import path from 'path';
+import zlib from 'zlib';
+import { fileURLToPath } from 'url';
 
 const SIZES = [16, 48, 128];
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ICON_DIR = path.join(__dirname, '..', 'icons');
 
-// Simple 1-pixel purple PNG as placeholder (valid PNG files)
-// In production, replace with actual designed icons
+function crc32(buf) {
+  let crc = 0xffffffff;
+  for (const byte of buf) {
+    crc ^= byte;
+    for (let i = 0; i < 8; i++) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function chunk(type, data) {
+  const typeBuf = Buffer.from(type);
+  const out = Buffer.alloc(12 + data.length);
+  out.writeUInt32BE(data.length, 0);
+  typeBuf.copy(out, 4);
+  data.copy(out, 8);
+  out.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 8 + data.length);
+  return out;
+}
+
 function createPlaceholderPNG(size) {
-  // Minimal valid PNG with purple color (#6366f1)
-  // This creates a 1x1 purple pixel PNG that browsers will scale
-  const header = Buffer.from([
-    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
-    0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
-    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1 pixels
-    0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, // 8-bit RGB
-    0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, // IDAT chunk
-    0x08, 0xD7, 0x63, 0x98, 0xC9, 0xF2, 0x1E, 0x00, // compressed pixel (purple-ish)
-    0x01, 0x05, 0x00, 0xFE, 0xC5, 0xAD, 0xA3, 0x6A, // 
-    0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, // IEND chunk
-    0xAE, 0x42, 0x60, 0x82,
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0);
+  ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+
+  const rows = [];
+  for (let y = 0; y < size; y++) {
+    const row = Buffer.alloc(1 + size * 4);
+    row[0] = 0;
+    for (let x = 0; x < size; x++) {
+      const offset = 1 + x * 4;
+      row[offset] = 99;
+      row[offset + 1] = 102;
+      row[offset + 2] = 241;
+      row[offset + 3] = 255;
+    }
+    rows.push(row);
+  }
+
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(Buffer.concat(rows))),
+    chunk('IEND', Buffer.alloc(0)),
   ]);
-  return header;
 }
 
 if (!fs.existsSync(ICON_DIR)) {

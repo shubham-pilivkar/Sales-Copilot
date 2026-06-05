@@ -175,17 +175,12 @@ async function stopAudioCapture() {
 async function startCopilot(tabId, email) {
   if (state !== CopilotState.IDLE && state !== CopilotState.ERROR) return;
 
-  // Check local + server-side audio consent before opening a session or capture.
+  // Check audio consent before capture. Local consent is required to proceed.
+  // Server-side consent is recorded async (non-blocking).
   const consent = await chrome.storage.local.get(StorageKey.AUDIO_CONSENT);
-  const hasLocalConsent = consent[StorageKey.AUDIO_CONSENT] === true;
-  const hasServerConsent = hasLocalConsent ? await checkAudioConsent().catch(() => false) : false;
-  if (!hasLocalConsent || !hasServerConsent) {
-    if (!hasServerConsent) {
-      await chrome.storage.local.remove(StorageKey.AUDIO_CONSENT);
-    }
+  if (!consent[StorageKey.AUDIO_CONSENT]) {
     pendingStart = { tabId, email };
     await chrome.storage.session.set({ [StorageKey.PENDING_START]: pendingStart });
-    // Open consent page — user must allow before we capture
     await chrome.windows.create({
       url: chrome.runtime.getURL('src/permission/consent.html'),
       type: 'popup',
@@ -193,7 +188,7 @@ async function startCopilot(tabId, email) {
       height: 520,
       focused: true,
     });
-    return;
+    return; // User needs to grant consent first
   }
 
   setState(CopilotState.CONNECTING);
@@ -273,9 +268,13 @@ onMessage({
     return updatePreferences(msg.preferences || {});
   },
   [MessageType.AUDIO_CONSENT_GRANTED]: async () => {
-    await recordAudioConsent();
+    // Set local consent immediately (always succeeds)
     await chrome.storage.local.set({ [StorageKey.AUDIO_CONSENT]: true });
 
+    // Record server-side consent (best-effort, don't block session start)
+    recordAudioConsent().catch(() => {});
+
+    // Resume pending session start
     const stored = await chrome.storage.session.get(StorageKey.PENDING_START);
     const start = pendingStart || stored[StorageKey.PENDING_START];
     pendingStart = null;

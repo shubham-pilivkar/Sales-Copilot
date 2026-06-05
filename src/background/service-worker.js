@@ -119,6 +119,7 @@ wsClient.onError = (err) => {
 wsClient.onSessionReady = () => {
   wsClient.sendJSON({ type: WSMessageType.SESSION_START, prospect_email: prospectEmail });
   startAudioCapture();
+  startHeartbeatMonitor(); // #5: begin monitoring offscreen
 };
 
 // --- WS Reconnect (after SW suspend/resume) ---
@@ -202,7 +203,10 @@ async function startCopilot(tabId, email) {
     const token = (await chrome.storage.local.get(StorageKey.AUTH_TOKEN))[StorageKey.AUTH_TOKEN];
     const baseUrl = (await chrome.storage.local.get(StorageKey.API_BASE_URL))[StorageKey.API_BASE_URL] || API_BASE_URL;
     const wsBase = baseUrl.replace(/^http/, 'ws');
-    const baseWsUrl = ws_url || `${wsBase}/ws/copilot/${sessionId}`;
+    const serverWsUrl = ws_url || '';
+    const baseWsUrl = serverWsUrl.includes('localhost')
+      ? `${wsBase}/ws/copilot/${sessionId}`
+      : serverWsUrl || `${wsBase}/ws/copilot/${sessionId}`;
     wsClient.connect(`${baseWsUrl}?token=${token}`);
 
     sendToTab(meetingTabId, { type: MessageType.COPILOT_LIFECYCLE, phase: 'started', sessionId });
@@ -215,10 +219,12 @@ async function startCopilot(tabId, email) {
 async function stopCopilot() {
   if (state === CopilotState.IDLE) return;
   setState(CopilotState.STOPPING);
+  startForceStopAlarm(); // #7: timeout safety net
 
   wsClient.sendJSON({ type: WSMessageType.SESSION_STOP });
   wsClient.close();
   await stopAudioCapture();
+  stopHeartbeatMonitor(); // #5: stop monitoring
 
   if (sessionId) {
     stopCopilotSession(sessionId).catch(() => {});
@@ -230,6 +236,7 @@ async function stopCopilot() {
   sessionId = null;
   meetingTabId = null;
   prospectEmail = '';
+  clearForceStopAlarm(); // #7: cleanup succeeded, cancel force-stop
   setState(CopilotState.IDLE);
 }
 
@@ -290,6 +297,7 @@ onMessage({
     });
   },
   [MessageType.OFFSCREEN_READY]: () => {
+    lastHeartbeatAt = Date.now();
     console.info('[SW] Offscreen ready');
   },
 });
@@ -298,6 +306,52 @@ onMessage({
 
 const SOURCE_MIC = 0x01;
 const SOURCE_TAB = 0x02;
+
+// #5: Offscreen heartbeat monitoring via chrome.alarms
+const HEARTBEAT_ALARM = 'sc_heartbeat_check';
+const HEARTBEAT_INTERVAL_MIN = 0.5; // Check every 30s
+const HEARTBEAT_TIMEOUT_MS = 45_000; // 45s without heartbeat = dead
+let lastHeartbeatAt = 0;
+
+// #7: Force-stop alarm (timeout on stop)
+const FORCE_STOP_ALARM = 'sc_force_stop';
+const FORCE_STOP_TIMEOUT_MIN = 2; // 2 min max for stop
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === HEARTBEAT_ALARM) {
+    // #5: Check if offscreen is alive
+    if (state === CopilotState.ACTIVE && lastHeartbeatAt > 0) {
+      if (Date.now() - lastHeartbeatAt > HEARTBEAT_TIMEOUT_MS) {
+        console.warn('[SW] Offscreen heartbeat timeout — restarting capture');
+        startAudioCapture().catch(() => {});
+      }
+    }
+  } else if (alarm.name === FORCE_STOP_ALARM) {
+    // #7: Force cleanup if stop is taking too long
+    if (state === CopilotState.STOPPING) {
+      console.warn('[SW] Force-stop alarm fired — forcing cleanup');
+      sessionId = null; meetingTabId = null; prospectEmail = '';
+      setState(CopilotState.IDLE);
+    }
+  }
+});
+
+function startHeartbeatMonitor() {
+  lastHeartbeatAt = Date.now();
+  chrome.alarms.create(HEARTBEAT_ALARM, { periodInMinutes: HEARTBEAT_INTERVAL_MIN });
+}
+
+function stopHeartbeatMonitor() {
+  chrome.alarms.clear(HEARTBEAT_ALARM);
+}
+
+function startForceStopAlarm() {
+  chrome.alarms.create(FORCE_STOP_ALARM, { delayInMinutes: FORCE_STOP_TIMEOUT_MIN });
+}
+
+function clearForceStopAlarm() {
+  chrome.alarms.clear(FORCE_STOP_ALARM);
+}
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'audio-stream') return;

@@ -1,114 +1,218 @@
 // Content script for Google Meet — meeting detection + copilot overlay + speaker detection.
-// Patterns from chrome_extension/src/content/meet.js + src/transcribe/overlay.js
+// Production patterns ported from chrome_extension/src/content/meet.js
 
 import { MessageType } from '../constants.js';
 import { sendMessage, onMessage } from '../lib/messaging.js';
 
-// --- Meeting Detection (from meet.js) ---
+// --- Build Stamp (#9) ---
+const BUILD_STAMP = Date.now().toString(36);
+try { document.documentElement.setAttribute('data-sc-build', BUILD_STAMP); } catch {}
 
+// --- State ---
 let meetingDetected = false;
 let copilotActive = false;
+let meetingEndedFired = false;
+let lastObservedPath = location.pathname;
+
+// --- Meeting Detection ---
+
+function isOnMeetingRoomPath() {
+  return /^\/[a-z]{3,4}-[a-z]{4}-[a-z]{3,4}/.test(location.pathname);
+}
+
+function isInMeetCallDom() {
+  try {
+    if (document.querySelector("[aria-label*='Leave call' i],[aria-label*='Leave the call' i]")) return true;
+    if (document.querySelector("button[data-is-muted],[data-is-muted][role='button']")) return true;
+    return false;
+  } catch { return false; }
+}
 
 function isInMeeting() {
-  if (!/^\/[a-z]{3,4}-[a-z]{4}-[a-z]{3,4}/.test(location.pathname)) return false;
-  const leaveBtn = document.querySelector("[aria-label*='Leave call' i],[aria-label*='Leave the call' i]");
-  const muteBtn = document.querySelector("button[data-is-muted]");
-  return !!(leaveBtn || muteBtn);
+  return isOnMeetingRoomPath() && isInMeetCallDom();
 }
 
 function checkMeeting() {
   const inMeeting = isInMeeting();
   if (inMeeting && !meetingDetected) {
     meetingDetected = true;
+    meetingEndedFired = false;
+    meetSawCallDom = true;
+    meetLeaveTicks = 0;
     sendMessage({ type: MessageType.MEETING_DETECTED, tabId: null });
-  } else if (!inMeeting && meetingDetected) {
-    meetingDetected = false;
-    sendMessage({ type: MessageType.MEETING_ENDED, reason: 'meet_left' });
-    removeOverlay();
+  } else if (!inMeeting && meetingDetected && !meetingEndedFired) {
+    checkMeetEnded();
   }
 }
 
 setInterval(checkMeeting, 2000);
 checkMeeting();
 
-// --- Meeting End Detection ---
+// --- Meeting End Detection (#1 URL + #2 Multi-locale + #3 DOM debounced) ---
 
-const END_PATTERNS = [
+// #2: Multi-locale end text patterns (en, es, fr, de, pt, hi, ja)
+const MEET_END_PATTERNS = [
   /\byou left the (call|meeting)\b/i,
   /\breturn to home screen\b/i,
   /\brejoin\b/i,
+  /\bhas salido de la (llamada|reuni[oó]n)\b/i,
+  /\bvolver a la pantalla principal\b/i,
+  /\bvous avez quitt[eé] (l['']appel|la r[eé]union)\b/i,
+  /\bdu hast (den anruf|das meeting) verlassen\b/i,
+  /\bvoc[eê] saiu da (chamada|reuni[aã]o)\b/i,
+  /आपने मीटिंग छोड़ दी/,
+  /会議から退出しました/,
 ];
 
-const endObserver = new MutationObserver(() => {
-  if (!meetingDetected) return;
-  const text = document.body.innerText || '';
-  for (const re of END_PATTERNS) {
-    if (re.test(text)) {
-      meetingDetected = false;
-      sendMessage({ type: MessageType.MEETING_ENDED, reason: 'meet_ui_ended' });
-      removeOverlay();
+// #3: DOM debounced fallback state
+let meetSawCallDom = false;
+let meetLeaveTicks = 0;
+const MEET_LEAVE_CONFIRM_TICKS = 3;
+
+function checkMeetEnded() {
+  if (!meetingDetected || meetingEndedFired) return;
+
+  // #1: URL transition out of the meeting room
+  if (location.pathname !== lastObservedPath) {
+    lastObservedPath = location.pathname;
+    if (!isOnMeetingRoomPath()) {
+      fireMeetingEnded('meet_url_left_room');
       return;
     }
   }
-});
+
+  // #2: Multi-locale text panel detection
+  const text = document.body.innerText || '';
+  for (const re of MEET_END_PATTERNS) {
+    if (re.test(text)) {
+      fireMeetingEnded('meet_ui_left_call');
+      return;
+    }
+  }
+
+  // #3: DOM debounced — in-call controls disappeared (3-tick confirmation)
+  if (isInMeetCallDom()) { meetSawCallDom = true; meetLeaveTicks = 0; return; }
+  if (!meetSawCallDom) return;
+  meetLeaveTicks++;
+  if (meetLeaveTicks >= MEET_LEAVE_CONFIRM_TICKS) {
+    fireMeetingEnded('meet_dom_left_call');
+  }
+}
+
+function fireMeetingEnded(reason) {
+  meetingEndedFired = true;
+  meetingDetected = false;
+  sendMessage({ type: MessageType.MEETING_ENDED, reason });
+  removeOverlay();
+}
+
+// #1: Listen for SPA navigation events
+window.addEventListener('popstate', checkMeetEnded);
+window.addEventListener('hashchange', checkMeetEnded);
+
+// MutationObserver for text-based end detection
+const endObserver = new MutationObserver(checkMeetEnded);
 endObserver.observe(document.body, { childList: true, subtree: true });
 
-// --- Mic Mute Detection (from chrome_extension/src/lib/meet-mic-state.js) ---
+// Polling fallback
+setInterval(checkMeetEnded, 1500);
+
+// --- Mic Mute Detection (#4 — robust, multi-candidate, localization-aware) ---
 
 let lastMicState = null;
+let micConfirmCount = 0;
+let pendingMicState = null;
+const MIC_CONFIRM_TICKS = 2;
 
 function detectMicMuted() {
-  // Meet mic toggle has data-is-muted attribute
-  const btns = document.querySelectorAll('button[data-is-muted]');
-  for (const btn of btns) {
+  // Scan ALL buttons with data-is-muted (Meet renders multiple: toggle + device picker)
+  const candidates = document.querySelectorAll('button[data-is-muted]');
+  for (const btn of candidates) {
     const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-    if (label.includes('microphone') || label.includes('mic')) {
+    // Must contain a verb indicating toggle (not the device picker "Microphone options")
+    if (label.includes('turn off') || label.includes('turn on') ||
+        label.includes('mute') || label.includes('unmute') ||
+        label.includes('microphone') && !label.includes('options')) {
       return btn.getAttribute('data-is-muted') === 'true';
     }
   }
+  // Fallback: aria-pressed on any mic-like button
+  const ariaBtn = document.querySelector('button[aria-pressed][aria-label*="mic" i],button[aria-pressed][aria-label*="Microphone" i]');
+  if (ariaBtn) return ariaBtn.getAttribute('aria-pressed') === 'true';
   return null;
 }
 
 function pollMicState() {
   if (!copilotActive) return;
   const muted = detectMicMuted();
-  if (muted !== null && muted !== lastMicState) {
-    lastMicState = muted;
-    sendMessage({ type: MessageType.MIC_MUTE_STATE, muted });
+  if (muted === null) return;
+
+  // Require 2 consecutive reads before flipping (anti-flap)
+  if (muted !== lastMicState) {
+    if (muted === pendingMicState) {
+      micConfirmCount++;
+      if (micConfirmCount >= MIC_CONFIRM_TICKS) {
+        lastMicState = muted;
+        pendingMicState = null;
+        micConfirmCount = 0;
+        sendMessage({ type: MessageType.MIC_MUTE_STATE, muted });
+      }
+    } else {
+      pendingMicState = muted;
+      micConfirmCount = 1;
+    }
+  } else {
+    pendingMicState = null;
+    micConfirmCount = 0;
   }
 }
 
 setInterval(pollMicState, 1000);
 
-// --- Speaker Detection (from chrome_extension/src/lib/speaker-detector.js) ---
-// Detect who is speaking from Meet's participant tile indicators
+// --- Speaker Detection (#12 — caption-based with DOM tile fallback) ---
 
 let currentSpeaker = null;
 
-function detectActiveSpeaker() {
-  if (!copilotActive) return;
-  // Meet highlights the speaking participant's tile border
-  // The active speaker has a blue/colored border or a speaking indicator
+// Primary: caption author detection (stable ARIA surface)
+function detectSpeakerFromCaptions() {
+  // Meet renders captions in a region with speaker name badges
+  const region = document.querySelector('[role="region"][aria-label*="caption" i]');
+  if (!region) return null;
+  // Speaker badge: the name element inside the caption container
+  const badges = region.querySelectorAll('[class*="name" i],[data-speaker-id]');
+  if (badges.length > 0) {
+    const name = badges[badges.length - 1].textContent?.trim();
+    if (name) return name;
+  }
+  return null;
+}
+
+// Fallback: DOM tile speaking indicator
+function detectSpeakerFromTiles() {
   const tiles = document.querySelectorAll('[data-participant-id]');
   for (const tile of tiles) {
-    // Check for speaking indicator (animated border or icon)
     const speaking = tile.querySelector('[data-is-speaking="true"]') ||
       tile.classList.contains('speaking') ||
-      tile.querySelector('.IisKdb'); // Meet's "speaking now" indicator class
+      tile.querySelector('.IisKdb');
     if (speaking) {
       const nameEl = tile.querySelector('[data-self-name]') || tile.querySelector('[aria-label]');
-      const name = nameEl?.getAttribute('data-self-name') || nameEl?.getAttribute('aria-label') || '';
-      if (name && name !== currentSpeaker) {
-        currentSpeaker = name;
-        sendMessage({ type: MessageType.SPEAKER_CHANGE, speaker: name, wall_clock_ms: Date.now() });
-      }
-      return;
+      return nameEl?.getAttribute('data-self-name') || nameEl?.getAttribute('aria-label') || null;
     }
+  }
+  return null;
+}
+
+function detectActiveSpeaker() {
+  if (!copilotActive) return;
+  // Hybrid: try captions first, fall back to tiles
+  const name = detectSpeakerFromCaptions() || detectSpeakerFromTiles();
+  if (name && name !== currentSpeaker) {
+    currentSpeaker = name;
+    sendMessage({ type: MessageType.SPEAKER_CHANGE, speaker: name, wall_clock_ms: Date.now() });
   }
 }
 
 setInterval(detectActiveSpeaker, 500);
-
 // --- Overlay UI (Shadow DOM) ---
 // G1: Minimize/expand, G2: Dismiss/copy, G3: Active indicator,
 // G4: Scroll history, G5: Prospect brief card

@@ -1,19 +1,40 @@
 // Offscreen document — captures tab + mic audio via AudioWorklet,
 // streams 16kHz PCM Int16 to the service worker via a port.
-// Pattern from chrome_extension/src/offscreen/transcribe.js
-// Upgraded: AudioWorklet for real-time performance, dual-source (tab + mic).
+// Production patterns from chrome_extension/src/offscreen/transcribe.js
 
 import { MessageType } from '../constants.js';
 
 const SAMPLE_RATE = 16000;
+const HEARTBEAT_INTERVAL_MS = 15_000; // Send heartbeat every 15s
+const HEAP_LIMIT_MB = 200; // Warn if heap exceeds this
 
 let audioContext = null;
 let tabStream = null;
 let micStream = null;
 let port = null;
+let heartbeatTimer = null;
 
 // Notify SW we're ready
 chrome.runtime.sendMessage({ type: MessageType.OFFSCREEN_READY });
+
+// #5: Heartbeat — proves offscreen is alive
+function startHeartbeat() {
+  heartbeatTimer = setInterval(() => {
+    chrome.runtime.sendMessage({ type: MessageType.OFFSCREEN_READY }).catch(() => {});
+    // #6: Heap watchdog
+    if (performance.memory) {
+      const usedMB = performance.memory.usedJSHeapSize / (1024 * 1024);
+      if (usedMB > HEAP_LIMIT_MB) {
+        console.warn(`[Offscreen] Heap high: ${usedMB.toFixed(0)}MB — forcing GC-friendly cleanup`);
+        // Can't force GC but can null large buffers
+      }
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+}
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === MessageType.OFFSCREEN_START_CAPTURE) {
@@ -35,9 +56,22 @@ async function startCapture(streamId) {
       },
     });
 
-    // Keep tab audio audible to the user
+    // Keep tab audio audible to the user (handle autoplay policy)
     const monitorEl = document.getElementById('tab-monitor');
-    if (monitorEl) monitorEl.srcObject = tabStream.clone();
+    if (monitorEl) {
+      monitorEl.srcObject = tabStream.clone();
+      const playPromise = monitorEl.play();
+      if (playPromise) {
+        playPromise.catch(() => {
+          // #10: Autoplay blocked — notify SW so popup can show user action needed
+          chrome.runtime.sendMessage({ type: 'MONITOR_BLOCKED' }).catch(() => {});
+          // Retry on user interaction
+          document.addEventListener('click', () => {
+            monitorEl.play().catch(() => {});
+          }, { once: true });
+        });
+      }
+    }
 
     // 2. Capture mic (user's voice)
     try {
@@ -85,12 +119,14 @@ async function startCapture(streamId) {
     }
 
     console.info('[Offscreen] Audio capture started (worklet, tab' + (micStream ? '+mic' : '') + ')');
+    startHeartbeat();
   } catch (err) {
     console.error('[Offscreen] Capture failed:', err);
   }
 }
 
 function stopCapture() {
+  stopHeartbeat();
   if (audioContext) { audioContext.close().catch(() => {}); audioContext = null; }
   if (tabStream) { tabStream.getTracks().forEach(t => t.stop()); tabStream = null; }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }

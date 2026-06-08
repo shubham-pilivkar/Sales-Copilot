@@ -1,12 +1,12 @@
 // Content script for Google Meet — meeting detection + copilot overlay + speaker detection.
-// Production patterns ported from chrome_extension/src/content/meet.js
 
 import { MessageType } from '../constants.js';
 import { sendMessage, onMessage } from '../lib/messaging.js';
+import type { Nudge, ProspectProfile } from '../types/ws.js';
 
 // --- Build Stamp (#9) ---
 const BUILD_STAMP = Date.now().toString(36);
-try { document.documentElement.setAttribute('data-sc-build', BUILD_STAMP); } catch {}
+try { document.documentElement.setAttribute('data-sc-build', BUILD_STAMP); } catch { /* ignore */ }
 
 // --- State ---
 let meetingDetected = false;
@@ -16,11 +16,11 @@ let lastObservedPath = location.pathname;
 
 // --- Meeting Detection ---
 
-function isOnMeetingRoomPath() {
+function isOnMeetingRoomPath(): boolean {
   return /^\/[a-z]{3,4}-[a-z]{4}-[a-z]{3,4}/.test(location.pathname);
 }
 
-function isInMeetCallDom() {
+function isInMeetCallDom(): boolean {
   try {
     if (document.querySelector("[aria-label*='Leave call' i],[aria-label*='Leave the call' i]")) return true;
     if (document.querySelector("button[data-is-muted],[data-is-muted][role='button']")) return true;
@@ -28,17 +28,18 @@ function isInMeetCallDom() {
   } catch { return false; }
 }
 
-function isInMeeting() {
+function isInMeeting(): boolean {
   return isOnMeetingRoomPath() && isInMeetCallDom();
 }
 
-function checkMeeting() {
+function checkMeeting(): void {
   const inMeeting = isInMeeting();
   if (inMeeting && !meetingDetected) {
     meetingDetected = true;
     meetingEndedFired = false;
     meetSawCallDom = true;
     meetLeaveTicks = 0;
+    startEndDetection();
     sendMessage({ type: MessageType.MEETING_DETECTED, tabId: null });
   } else if (!inMeeting && meetingDetected && !meetingEndedFired) {
     checkMeetEnded();
@@ -69,7 +70,7 @@ let meetSawCallDom = false;
 let meetLeaveTicks = 0;
 const MEET_LEAVE_CONFIRM_TICKS = 3;
 
-function checkMeetEnded() {
+function checkMeetEnded(): void {
   if (!meetingDetected || meetingEndedFired) return;
 
   // #1: URL transition out of the meeting room
@@ -81,7 +82,13 @@ function checkMeetEnded() {
     }
   }
 
-  // #2: Multi-locale text panel detection
+  // While in-call controls are still present we are NOT on the end screen.
+  // Reset the debounce and skip the text scan — otherwise chat/shared-content
+  // text matching an end phrase (e.g. someone typing "rejoin") would falsely
+  // end a live meeting.
+  if (isInMeetCallDom()) { meetSawCallDom = true; meetLeaveTicks = 0; return; }
+
+  // #2: Multi-locale end-screen text detection (only once controls are gone).
   const text = document.body.innerText || '';
   for (const re of MEET_END_PATTERNS) {
     if (re.test(text)) {
@@ -91,7 +98,6 @@ function checkMeetEnded() {
   }
 
   // #3: DOM debounced — in-call controls disappeared (3-tick confirmation)
-  if (isInMeetCallDom()) { meetSawCallDom = true; meetLeaveTicks = 0; return; }
   if (!meetSawCallDom) return;
   meetLeaveTicks++;
   if (meetLeaveTicks >= MEET_LEAVE_CONFIRM_TICKS) {
@@ -99,50 +105,79 @@ function checkMeetEnded() {
   }
 }
 
-function fireMeetingEnded(reason) {
+function fireMeetingEnded(reason: string): void {
   meetingEndedFired = true;
   meetingDetected = false;
+  stopEndDetection();
   sendMessage({ type: MessageType.MEETING_ENDED, reason });
   removeOverlay();
+}
+
+// End-detection runs only while a meeting is active, so the subtree observer
+// (which fires checkMeetEnded on every DOM mutation) and the poll aren't
+// burning CPU on a left/idle page.
+let endObserver: MutationObserver | null = null;
+let endPollInterval: ReturnType<typeof setInterval> | null = null;
+
+function startEndDetection(): void {
+  if (!endObserver) {
+    endObserver = new MutationObserver(checkMeetEnded);
+    endObserver.observe(document.body, { childList: true, subtree: true });
+  }
+  if (!endPollInterval) endPollInterval = setInterval(checkMeetEnded, 1500);
+}
+
+function stopEndDetection(): void {
+  if (endObserver) { endObserver.disconnect(); endObserver = null; }
+  if (endPollInterval) { clearInterval(endPollInterval); endPollInterval = null; }
 }
 
 // #1: Listen for SPA navigation events
 window.addEventListener('popstate', checkMeetEnded);
 window.addEventListener('hashchange', checkMeetEnded);
 
-// MutationObserver for text-based end detection
-const endObserver = new MutationObserver(checkMeetEnded);
-endObserver.observe(document.body, { childList: true, subtree: true });
-
-// Polling fallback
-setInterval(checkMeetEnded, 1500);
-
 // --- Mic Mute Detection (#4 — robust, multi-candidate, localization-aware) ---
 
-let lastMicState = null;
+let lastMicState: boolean | null = null;
 let micConfirmCount = 0;
-let pendingMicState = null;
+let pendingMicState: boolean | null = null;
 const MIC_CONFIRM_TICKS = 2;
 
-function detectMicMuted() {
-  // Scan ALL buttons with data-is-muted (Meet renders multiple: toggle + device picker)
-  const candidates = document.querySelectorAll('button[data-is-muted]');
+// Localized hints for the mic toggle and for camera/picker controls to exclude.
+// The data-is-muted attribute itself is language-independent; labels are only
+// used to pick the right button among several (mic vs camera vs device picker).
+const MIC_LABEL_HINTS = ['microphone', 'mic', 'micro', 'mikrofon', 'micrófono', 'マイク', 'माइक', 'mute', 'unmute', 'turn off', 'turn on'];
+const NOT_MIC_HINTS = ['camera', 'video', 'cámara', 'caméra', 'kamera', 'カメラ', 'options', 'opciones'];
+
+function isCameraOrPicker(label: string): boolean {
+  return NOT_MIC_HINTS.some((h) => label.includes(h));
+}
+
+function detectMicMuted(): boolean | null {
+  // Meet renders multiple buttons with data-is-muted (mic toggle, camera
+  // toggle, sometimes a device picker). Pick the mic one.
+  const candidates = [...document.querySelectorAll('button[data-is-muted]')];
+  let micBtn: Element | null = null;
   for (const btn of candidates) {
     const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-    // Must contain a verb indicating toggle (not the device picker "Microphone options")
-    if (label.includes('turn off') || label.includes('turn on') ||
-        label.includes('mute') || label.includes('unmute') ||
-        label.includes('microphone') && !label.includes('options')) {
-      return btn.getAttribute('data-is-muted') === 'true';
-    }
+    if (isCameraOrPicker(label)) continue;
+    if (MIC_LABEL_HINTS.some((h) => label.includes(h))) { micBtn = btn; break; }
   }
+  // Language-independent fallback: if exactly one data-is-muted button is left
+  // after excluding camera/picker controls, it's the mic — works on any locale.
+  if (!micBtn) {
+    const nonCamera = candidates.filter((b) => !isCameraOrPicker((b.getAttribute('aria-label') || '').toLowerCase()));
+    if (nonCamera.length === 1) micBtn = nonCamera[0];
+  }
+  if (micBtn) return micBtn.getAttribute('data-is-muted') === 'true';
+
   // Fallback: aria-pressed on any mic-like button
   const ariaBtn = document.querySelector('button[aria-pressed][aria-label*="mic" i],button[aria-pressed][aria-label*="Microphone" i]');
   if (ariaBtn) return ariaBtn.getAttribute('aria-pressed') === 'true';
   return null;
 }
 
-function pollMicState() {
+function pollMicState(): void {
   if (!copilotActive) return;
   const muted = detectMicMuted();
   if (muted === null) return;
@@ -171,10 +206,10 @@ setInterval(pollMicState, 1000);
 
 // --- Speaker Detection (#12 — caption-based with DOM tile fallback) ---
 
-let currentSpeaker = null;
+let currentSpeaker: string | null = null;
 
 // Primary: caption author detection (stable ARIA surface)
-function detectSpeakerFromCaptions() {
+function detectSpeakerFromCaptions(): string | null {
   // Meet renders captions in a region with speaker name badges
   const region = document.querySelector('[role="region"][aria-label*="caption" i]');
   if (!region) return null;
@@ -188,7 +223,7 @@ function detectSpeakerFromCaptions() {
 }
 
 // Fallback: DOM tile speaking indicator
-function detectSpeakerFromTiles() {
+function detectSpeakerFromTiles(): string | null {
   const tiles = document.querySelectorAll('[data-participant-id]');
   for (const tile of tiles) {
     const speaking = tile.querySelector('[data-is-speaking="true"]') ||
@@ -202,7 +237,7 @@ function detectSpeakerFromTiles() {
   return null;
 }
 
-function detectActiveSpeaker() {
+function detectActiveSpeaker(): void {
   if (!copilotActive) return;
   // Hybrid: try captions first, fall back to tiles
   const name = detectSpeakerFromCaptions() || detectSpeakerFromTiles();
@@ -213,26 +248,29 @@ function detectActiveSpeaker() {
 }
 
 setInterval(detectActiveSpeaker, 500);
+
 // --- Overlay UI (Shadow DOM) ---
 // G1: Minimize/expand, G2: Dismiss/copy, G3: Active indicator,
 // G4: Scroll history, G5: Prospect brief card
 
 const OVERLAY_ID = 'sales-copilot-overlay';
-let shadowHost = null;
-let shadowRoot = null;
-let nudgeContainer = null;
+let shadowHost: HTMLElement | null = null;
+let shadowRoot: ShadowRoot | null = null;
+let nudgeContainer: HTMLElement | null = null;
 let minimized = false;
-let prospectData = null;
+let prospectData: ProspectProfile | null = null;
 let nudgeCount = 0;
 
-function createOverlay() {
+function createOverlay(): void {
   if (shadowHost) return;
 
-  shadowHost = document.createElement('div');
-  shadowHost.id = OVERLAY_ID;
-  shadowRoot = shadowHost.attachShadow({ mode: 'closed' });
+  const host = document.createElement('div');
+  host.id = OVERLAY_ID;
+  shadowHost = host;
+  const root = host.attachShadow({ mode: 'closed' });
+  shadowRoot = root;
 
-  shadowRoot.innerHTML = `
+  root.innerHTML = `
     <style>
       :host { all: initial; }
       * { box-sizing: border-box; }
@@ -339,38 +377,39 @@ function createOverlay() {
     </div>
   `;
 
-  nudgeContainer = shadowRoot.getElementById('nudge-list');
-  document.body.appendChild(shadowHost);
+  nudgeContainer = root.getElementById('nudge-list');
+  document.body.appendChild(host);
 
   // G1: Minimize/expand handlers
-  shadowRoot.getElementById('minimize-btn').addEventListener('click', () => toggleMinimize(true));
-  shadowRoot.getElementById('copilot-pill').addEventListener('click', () => toggleMinimize(false));
+  root.getElementById('minimize-btn')?.addEventListener('click', () => toggleMinimize(true));
+  root.getElementById('copilot-pill')?.addEventListener('click', () => toggleMinimize(false));
 
   // G2: Keyboard shortcut — Esc to dismiss top nudge
-  document.addEventListener('keydown', (e) => {
+  document.addEventListener('keydown', (e: KeyboardEvent) => {
     if (e.key === 'Escape' && copilotActive && !minimized) {
       const first = nudgeContainer?.querySelector('.nudge-card');
-      if (first) dismissNudge(first);
+      if (first) dismissNudge(first as HTMLElement);
     }
   });
 }
 
 // G1: Toggle minimize
-function toggleMinimize(min) {
-  if (!shadowRoot) return;
+function toggleMinimize(min: boolean): void {
+  const root = shadowRoot;
+  if (!root) return;
   minimized = min;
-  shadowRoot.getElementById('copilot-panel').classList.toggle('minimized', min);
-  shadowRoot.getElementById('copilot-pill').classList.toggle('visible', min);
+  root.getElementById('copilot-panel')?.classList.toggle('minimized', min);
+  root.getElementById('copilot-pill')?.classList.toggle('visible', min);
 }
 
 // Auto-expand on critical nudge
-function autoExpandIfNeeded(priority) {
+function autoExpandIfNeeded(priority?: string): void {
   if (minimized && (priority === 'critical' || priority === 'high')) {
     toggleMinimize(false);
   }
 }
 
-function removeOverlay() {
+function removeOverlay(): void {
   if (shadowHost) {
     shadowHost.remove();
     shadowHost = null;
@@ -382,16 +421,17 @@ function removeOverlay() {
 }
 
 // G2 + G4: Add nudge with dismiss/copy and unlimited scroll
-function addNudge(nudge) {
-  if (!nudgeContainer) return;
-  const empty = nudgeContainer.querySelector('.empty');
+function addNudge(nudge: Nudge): void {
+  const container = nudgeContainer;
+  if (!container) return;
+  const empty = container.querySelector('.empty');
   if (empty) empty.remove();
 
   nudgeCount++;
   autoExpandIfNeeded(nudge.priority);
 
   // Mark older nudges
-  const existing = nudgeContainer.querySelectorAll('.nudge-card:not(.old)');
+  const existing = container.querySelectorAll('.nudge-card:not(.old)');
   if (existing.length > 3) {
     existing[existing.length - 1]?.classList.add('old');
   }
@@ -408,13 +448,13 @@ function addNudge(nudge) {
   `;
 
   // G2: Dismiss button
-  card.querySelector('.nudge-dismiss').addEventListener('click', () => dismissNudge(card));
+  card.querySelector('.nudge-dismiss')?.addEventListener('click', () => dismissNudge(card));
 
   // G2: Copy suggested response on click
   const suggestion = card.querySelector('.nudge-suggestion');
   if (suggestion) {
     suggestion.addEventListener('click', () => {
-      navigator.clipboard.writeText(nudge.suggested_response).catch(() => {});
+      navigator.clipboard.writeText(nudge.suggested_response || '').catch(() => {});
       suggestion.textContent = '✓ Copied!';
       setTimeout(() => { suggestion.textContent = `"${nudge.suggested_response}"`; }, 1500);
       sendMessage({ type: MessageType.NUDGE_ACTED, nudge_id: nudge.id, nudge_type: nudge.type });
@@ -422,32 +462,34 @@ function addNudge(nudge) {
   }
 
   // G4: Prepend and auto-scroll to top
-  nudgeContainer.prepend(card);
-  nudgeContainer.scrollTop = 0;
+  container.prepend(card);
+  container.scrollTop = 0;
 
   // Update pill badge
-  if (minimized) {
-    const badge = shadowRoot.getElementById('pill-badge');
+  const root = shadowRoot;
+  if (minimized && root) {
+    const badge = root.getElementById('pill-badge');
     if (badge) badge.textContent = String(nudgeCount);
   }
 }
 
 // G2: Dismiss nudge
-function dismissNudge(card) {
+function dismissNudge(card: HTMLElement): void {
   const id = card.dataset.nudgeId;
   const type = card.dataset.nudgeType;
   card.remove();
-  if (id) sendMessage({ type: MessageType.NUDGE_DISMISS, nudge_id: id, nudge_type: type });
+  if (id) sendMessage({ type: MessageType.NUDGE_DISMISS, nudge_id: id, nudge_type: type || '' });
 }
 
 // G5: Show prospect brief card
-function showProspectBrief(profile) {
-  if (!shadowRoot) return;
+function showProspectBrief(profile: ProspectProfile): void {
+  const root = shadowRoot;
+  if (!root) return;
   prospectData = profile;
-  const el = shadowRoot.getElementById('prospect-brief');
+  const el = root.getElementById('prospect-brief');
   if (!el || !profile) return;
 
-  const parts = [];
+  const parts: string[] = [];
   if (profile.name) parts.push(`<strong>${escapeHtml(profile.name)}</strong>`);
   if (profile.title) parts.push(escapeHtml(profile.title));
   if (profile.company) parts.push(`<span class="company">${escapeHtml(profile.company)}</span>`);
@@ -461,46 +503,53 @@ function showProspectBrief(profile) {
   setTimeout(() => { el.classList.remove('visible'); }, 15000);
 }
 
-function updateTalkRatio(ratio, warning) {
-  if (!shadowRoot) return;
-  const el = shadowRoot.getElementById('talk-ratio');
-  const text = shadowRoot.getElementById('ratio-text');
+function updateTalkRatio(ratio: number, warning?: boolean): void {
+  const root = shadowRoot;
+  if (!root) return;
+  const el = root.getElementById('talk-ratio');
+  const text = root.getElementById('ratio-text');
+  if (!el || !text) return;
   el.style.display = 'flex';
   const pct = Math.round(ratio * 100);
   text.textContent = `You: ${pct}% | Prospect: ${100 - pct}%`;
   text.className = warning ? 'warn' : '';
 }
 
-function updateStage(stage) {
-  if (!shadowRoot) return;
-  const el = shadowRoot.getElementById('stage-text');
-  const el2 = shadowRoot.getElementById('talk-ratio');
+function updateStage(stage: string): void {
+  const root = shadowRoot;
+  if (!root || !stage) return;
+  const el = root.getElementById('stage-text');
+  const el2 = root.getElementById('talk-ratio');
+  if (!el || !el2) return;
   el2.style.display = 'flex';
-  el.textContent = stage.replace(/_/g, ' ').replace(/^\w/, c => c.toUpperCase());
+  el.textContent = stage.replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
 }
 
-function updateStatus(text) {
-  if (!shadowRoot) return;
-  shadowRoot.getElementById('overlay-status').textContent = text;
+function updateStatus(text: string): void {
+  const root = shadowRoot;
+  if (!root) return;
+  const el = root.getElementById('overlay-status');
+  if (el) el.textContent = text;
 }
 
-function showOfflineBanner(show) {
-  if (!shadowRoot) return;
-  let banner = shadowRoot.getElementById('offline-banner');
+function showOfflineBanner(show: boolean): void {
+  const root = shadowRoot;
+  if (!root) return;
+  const banner = root.getElementById('offline-banner');
   if (show && !banner) {
-    banner = document.createElement('div');
-    banner.id = 'offline-banner';
-    banner.style.cssText = 'padding:6px 14px;background:#fef3c7;color:#92400e;font-size:11px;text-align:center;border-bottom:1px solid #fde68a;';
-    banner.textContent = '⚠ Connection lost — showing cached nudges. Reconnecting...';
-    const panel = shadowRoot.getElementById('copilot-panel');
-    const nudges = shadowRoot.getElementById('nudge-list');
-    if (panel && nudges) panel.insertBefore(banner, nudges);
+    const created = document.createElement('div');
+    created.id = 'offline-banner';
+    created.style.cssText = 'padding:6px 14px;background:#fef3c7;color:#92400e;font-size:11px;text-align:center;border-bottom:1px solid #fde68a;';
+    created.textContent = '⚠ Connection lost — showing cached nudges. Reconnecting...';
+    const panel = root.getElementById('copilot-panel');
+    const nudges = root.getElementById('nudge-list');
+    if (panel && nudges) panel.insertBefore(created, nudges);
   } else if (!show && banner) {
     banner.remove();
   }
 }
 
-function escapeHtml(s) {
+function escapeHtml(s: string): string {
   const div = document.createElement('div');
   div.textContent = s;
   return div.innerHTML;
@@ -521,6 +570,7 @@ onMessage({
     }
   },
   NUDGE: (msg) => {
+    if (!msg.nudge) return;
     updateStatus('Active');
     addNudge(msg.nudge);
   },
@@ -540,12 +590,18 @@ onMessage({
     updateStatus(msg.code === 'max_reconnect' ? 'Disconnected' : 'Reconnecting...');
     showOfflineBanner(true);
   },
+  [MessageType.COPILOT_NOTICE]: (msg) => {
+    // Non-fatal user-facing notice (e.g. autoplay blocked, capture failed).
+    if (msg.message) updateStatus(msg.message);
+  },
   [MessageType.STATE_UPDATE]: (msg) => {
     if (msg.state === 'ACTIVE') {
       updateStatus('Active');
       showOfflineBanner(false);
+    } else if (msg.state === 'RECONNECTING') {
+      updateStatus('Reconnecting...');
+    } else if (msg.state === 'ERROR') {
+      updateStatus('Error');
     }
-    else if (msg.state === 'RECONNECTING') updateStatus('Reconnecting...');
-    else if (msg.state === 'ERROR') updateStatus('Error');
   },
 });

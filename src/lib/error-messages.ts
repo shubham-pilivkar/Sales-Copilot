@@ -1,7 +1,6 @@
 // Structured error messages — user-friendly text for each error code.
-// Ported from chrome_extension/src/lib/error-messages.js
 
-const ERROR_MESSAGES = {
+const ERROR_MESSAGES: Record<string, string> = {
   // Auth
   auth_expired: 'Your session has expired. Please log in again.',
   login_failed: 'Invalid email or password.',
@@ -30,21 +29,13 @@ const ERROR_MESSAGES = {
   unknown: 'Something went wrong. Please try again.',
 };
 
-/**
- * Get a user-friendly error message for a code.
- * @param {string} code
- * @returns {string}
- */
-export function getErrorMessage(code) {
+/** Get a user-friendly error message for a code. */
+export function getErrorMessage(code: string): string {
   return ERROR_MESSAGES[code] || ERROR_MESSAGES.unknown;
 }
 
-/**
- * Render an error message string from a backend error event.
- * @param {{ code?: string, message?: string }} error
- * @returns {string}
- */
-export function renderError(error) {
+/** Render an error message string from a backend error event. */
+export function renderError(error: { code?: string; message?: string } | null | undefined): string {
   if (!error) return ERROR_MESSAGES.unknown;
-  return ERROR_MESSAGES[error.code] || error.message || ERROR_MESSAGES.unknown;
+  return (error.code ? ERROR_MESSAGES[error.code] : undefined) || error.message || ERROR_MESSAGES.unknown;
 }

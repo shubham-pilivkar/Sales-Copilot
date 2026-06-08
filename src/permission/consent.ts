@@ -2,10 +2,10 @@
 
 import { MessageType } from '../constants.js';
 
-const allowBtn = document.getElementById('allow-btn');
-const denyBtn = document.getElementById('deny-btn');
+const allowBtn = document.getElementById('allow-btn') as HTMLButtonElement;
+const denyBtn = document.getElementById('deny-btn') as HTMLButtonElement;
 
-function setError(message) {
+function setError(message: string): void {
   let el = document.getElementById('consent-error');
   if (!el) {
     el = document.createElement('div');

@@ -1,10 +1,12 @@
 // Popup — auth gate + copilot controls.
-// Pattern from chrome_extension/src/popup/popup.js
 
 import { CopilotState, MessageType, StorageKey } from '../constants.js';
 import { sendMessage } from '../lib/messaging.js';
+import type { Preferences } from '../types/api.js';
+import type { CopilotStateSnapshot } from '../types/messages.js';
 
-const $ = (id) => document.getElementById(id);
+const $ = <T extends HTMLElement = HTMLElement>(id: string): T =>
+  document.getElementById(id) as T;
 
 const els = {
   dot: $('status-dot'),
@@ -12,33 +14,34 @@ const els = {
   copilotSection: $('copilot-section'),
   tabLogin: $('tab-login'),
   tabRegister: $('tab-register'),
-  authEmail: $('auth-email'),
-  authName: $('auth-name'),
-  authPassword: $('auth-password'),
-  authSubmit: $('auth-submit'),
+  authEmail: $<HTMLInputElement>('auth-email'),
+  authName: $<HTMLInputElement>('auth-name'),
+  authPassword: $<HTMLInputElement>('auth-password'),
+  authSubmit: $<HTMLButtonElement>('auth-submit'),
   authError: $('auth-error'),
   userEmail: $('user-email'),
   logoutLink: $('logout-link'),
   idlePanel: $('idle-panel'),
   activePanel: $('active-panel'),
-  prospectEmail: $('prospect-email'),
-  startBtn: $('start-btn'),
-  stopBtn: $('stop-btn'),
+  prospectEmail: $<HTMLInputElement>('prospect-email'),
+  startBtn: $<HTMLButtonElement>('start-btn'),
+  stopBtn: $<HTMLButtonElement>('stop-btn'),
   statusBar: $('status-bar'),
   prospectDisplay: $('prospect-display'),
   copilotError: $('copilot-error'),
   nudgePrefs: $('nudge-prefs'),
-  storeTranscripts: $('store-transcripts'),
-  storeNudges: $('store-nudges'),
-  retentionDays: $('retention-days'),
+  storeTranscripts: $<HTMLInputElement>('store-transcripts'),
+  storeNudges: $<HTMLInputElement>('store-nudges'),
+  retentionDays: $<HTMLInputElement>('retention-days'),
   prefsStatus: $('prefs-status'),
 };
 
 let isLoginMode = true;
-let preferences = null;
-let prefsSaveTimer = null;
+let preferences: Preferences | null = null;
+let prefsSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let prefsSaveSeq = 0;
 
-const PREF_LABELS = {
+const PREF_LABELS: Record<string, string> = {
   objection_handling: 'Objections',
   discovery_question: 'Discovery',
   pain_point: 'Pain',
@@ -52,7 +55,7 @@ const PREF_LABELS = {
 };
 
 // --- Init ---
-async function init() {
+async function init(): Promise<void> {
   const got = await chrome.storage.local.get([StorageKey.AUTH_TOKEN, StorageKey.USER_EMAIL]);
   if (got[StorageKey.AUTH_TOKEN]) {
     showCopilotSection(got[StorageKey.USER_EMAIL]);
@@ -64,12 +67,12 @@ async function init() {
 }
 
 // --- Auth ---
-function showAuthSection() {
+function showAuthSection(): void {
   els.authSection.classList.remove('hidden');
   els.copilotSection.classList.add('hidden');
 }
 
-function showCopilotSection(email) {
+function showCopilotSection(email: string): void {
   els.authSection.classList.add('hidden');
   els.copilotSection.classList.remove('hidden');
   els.userEmail.textContent = email || '';
@@ -120,17 +123,17 @@ els.authSubmit.addEventListener('click', async () => {
   }
 });
 
-async function loadPreferences() {
-  const res = await sendMessage({ type: MessageType.GET_PREFERENCES });
+async function loadPreferences(): Promise<void> {
+  const res = await sendMessage<Preferences>({ type: MessageType.GET_PREFERENCES });
   if (!res.ok || !res.data) return;
   preferences = res.data;
   renderPreferences();
 }
 
-function renderPreferences() {
+function renderPreferences(): void {
   if (!preferences || !els.nudgePrefs) return;
   els.nudgePrefs.innerHTML = '';
-  const prefs = preferences.nudge_preferences || {};
+  const prefs = (preferences.nudge_preferences || {}) as Record<string, boolean>;
   for (const [key, label] of Object.entries(PREF_LABELS)) {
     const row = document.createElement('label');
     const checked = prefs[key] !== false;
@@ -142,24 +145,29 @@ function renderPreferences() {
   els.retentionDays.value = String(preferences.retention_days ?? 90);
 }
 
-function schedulePreferenceSave() {
-  clearTimeout(prefsSaveTimer);
+function schedulePreferenceSave(): void {
+  if (prefsSaveTimer) clearTimeout(prefsSaveTimer);
   els.prefsStatus.textContent = 'Saving...';
   prefsSaveTimer = setTimeout(savePreferences, 250);
 }
 
-async function savePreferences() {
-  const nudgePreferences = {};
-  for (const input of els.nudgePrefs.querySelectorAll('input[data-pref]')) {
-    nudgePreferences[input.dataset.pref] = input.checked;
+async function savePreferences(): Promise<void> {
+  const seq = ++prefsSaveSeq;
+  const nudgePreferences: Record<string, boolean> = {};
+  for (const input of els.nudgePrefs.querySelectorAll<HTMLInputElement>('input[data-pref]')) {
+    if (input.dataset.pref) nudgePreferences[input.dataset.pref] = input.checked;
   }
-  const payload = {
+  const rd = parseInt(els.retentionDays.value, 10);
+  const payload: Preferences = {
     nudge_preferences: nudgePreferences,
     store_transcripts: els.storeTranscripts.checked,
     store_nudges: els.storeNudges.checked,
-    retention_days: Number(els.retentionDays.value || 0),
+    retention_days: Number.isFinite(rd) ? rd : 90,
   };
-  const res = await sendMessage({ type: MessageType.UPDATE_PREFERENCES, preferences: payload });
+  const res = await sendMessage<Preferences>({ type: MessageType.UPDATE_PREFERENCES, preferences: payload });
+  // Ignore a stale response if a newer save has since started (last-write-wins
+  // on the DOM, not on whichever network response happens to land last).
+  if (seq !== prefsSaveSeq) return;
   if (res.ok && res.data) {
     preferences = res.data;
     els.prefsStatus.textContent = 'Saved';
@@ -173,7 +181,7 @@ els.storeTranscripts.addEventListener('change', schedulePreferenceSave);
 els.storeNudges.addEventListener('change', schedulePreferenceSave);
 els.retentionDays.addEventListener('change', schedulePreferenceSave);
 
-function showAuthError(msg) {
+function showAuthError(msg: string): void {
   els.authError.textContent = msg;
   els.authError.classList.remove('hidden');
 }
@@ -196,7 +204,7 @@ els.startBtn.addEventListener('click', async () => {
 
   // Get active tab (must be on meet.google.com)
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.url?.includes('meet.google.com')) {
+  if (!tab || !tab.url?.includes('meet.google.com') || tab.id === undefined) {
     showCopilotError('Open a Google Meet call first');
     els.startBtn.disabled = false;
     return;
@@ -216,19 +224,19 @@ els.stopBtn.addEventListener('click', async () => {
   await sendMessage({ type: MessageType.STOP_COPILOT });
 });
 
-function showCopilotError(msg) {
+function showCopilotError(msg: string): void {
   els.copilotError.textContent = msg;
   els.copilotError.classList.remove('hidden');
 }
 
 // --- State Rendering ---
 
-async function refreshState() {
-  const res = await sendMessage({ type: MessageType.GET_STATE });
+async function refreshState(): Promise<void> {
+  const res = await sendMessage<CopilotStateSnapshot>({ type: MessageType.GET_STATE });
   if (res.ok && res.data) renderState(res.data);
 }
 
-function renderState(s) {
+function renderState(s: CopilotStateSnapshot): void {
   // Dot
   els.dot.className = 'dot';
   if (s.state === CopilotState.ACTIVE) els.dot.classList.add('dot-active');
@@ -258,7 +266,7 @@ function renderState(s) {
 }
 
 // Listen for state broadcasts from SW
-chrome.runtime.onMessage.addListener((msg) => {
+chrome.runtime.onMessage.addListener((msg: { type?: string } & CopilotStateSnapshot) => {
   if (msg.type === MessageType.STATE_UPDATE) renderState(msg);
 });
 

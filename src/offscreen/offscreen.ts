@@ -10,11 +10,25 @@ const HEAP_LIMIT_MB = 200; // Warn if heap exceeds this
 let audioContext: AudioContext | null = null;
 let tabStream: MediaStream | null = null;
 let micStream: MediaStream | null = null;
+let monitorStream: MediaStream | null = null;
 let port: chrome.runtime.Port | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
-// Notify SW we're ready
-chrome.runtime.sendMessage({ type: MessageType.OFFSCREEN_READY });
+// chrome.runtime.Port messages are JSON-serialized (NOT structured-cloned), so
+// an ArrayBuffer would arrive at the SW as `{}` and all audio would be silently
+// dropped. Encode PCM as base64 for the hop; the SW decodes it back to bytes.
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const CHUNK = 0x8000; // avoid arg-count limits on fromCharCode.apply
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+// Notify SW we're ready (catch: the SW may be mid-restart at boot)
+chrome.runtime.sendMessage({ type: MessageType.OFFSCREEN_READY }).catch(() => {});
 
 // #5: Heartbeat — proves offscreen is alive
 function startHeartbeat(): void {
@@ -67,7 +81,11 @@ async function startCapture(streamId: string): Promise<void> {
     // Keep tab audio audible to the user (handle autoplay policy)
     const monitorEl = document.getElementById('tab-monitor') as HTMLAudioElement | null;
     if (monitorEl) {
-      monitorEl.srcObject = tab.clone();
+      // Keep a reference to the clone so stopCapture can stop its tracks —
+      // stopping the original's tracks does NOT stop a clone, so without this
+      // the tab-capture indicator stays on and a track leaks per restart.
+      monitorStream = tab.clone();
+      monitorEl.srcObject = monitorStream;
       const playPromise = monitorEl.play();
       if (playPromise) {
         playPromise.catch(() => {
@@ -101,6 +119,11 @@ async function startCapture(streamId: string): Promise<void> {
     // 5. Open port to SW
     const p = chrome.runtime.connect({ name: 'audio-stream' });
     port = p;
+    // If the SW goes away (crash/terminate), null the port so the worklet
+    // callbacks stop posting to a dead port (which throws every ~100ms).
+    p.onDisconnect.addListener(() => {
+      if (port === p) port = null;
+    });
 
     // 6. Wire tab audio → worklet → silent sink (keeps process() firing)
     const silentSink = ctx.createGain();
@@ -116,7 +139,7 @@ async function startCapture(streamId: string): Promise<void> {
       const out = port;
       if (!out) return;
       if (ev.data instanceof ArrayBuffer) {
-        out.postMessage({ type: 'audio_chunk', data: ev.data, source: 'tab' });
+        out.postMessage({ type: 'audio_chunk', data: arrayBufferToBase64(ev.data), source: 'tab' });
       }
     };
     tabSource.connect(tabWorklet);
@@ -130,7 +153,7 @@ async function startCapture(streamId: string): Promise<void> {
         const out = port;
         if (!out) return;
         if (ev.data instanceof ArrayBuffer) {
-          out.postMessage({ type: 'audio_chunk', data: ev.data, source: 'mic' });
+          out.postMessage({ type: 'audio_chunk', data: arrayBufferToBase64(ev.data), source: 'mic' });
         }
       };
       micSource.connect(micWorklet);
@@ -155,6 +178,9 @@ function stopCapture(): void {
   if (audioContext) { audioContext.close().catch(() => {}); audioContext = null; }
   if (tabStream) { tabStream.getTracks().forEach((t) => t.stop()); tabStream = null; }
   if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+  if (monitorStream) { monitorStream.getTracks().forEach((t) => t.stop()); monitorStream = null; }
+  const monitorEl = document.getElementById('tab-monitor') as HTMLAudioElement | null;
+  if (monitorEl) monitorEl.srcObject = null;
   if (port) { port.disconnect(); port = null; }
   console.info('[Offscreen] Audio capture stopped');
 }

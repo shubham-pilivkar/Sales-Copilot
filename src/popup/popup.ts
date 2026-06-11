@@ -261,6 +261,9 @@ function renderState(s: CopilotStateSnapshot): void {
     } else if (s.state === CopilotState.CONNECTING || s.state === CopilotState.RECONNECTING) {
       els.statusBar.classList.add('status-connecting');
       els.statusBar.textContent = 'Connecting...';
+    } else if (s.state === CopilotState.STOPPING) {
+      els.statusBar.classList.add('status-connecting');
+      els.statusBar.textContent = 'Stopping...';
     }
   }
 }

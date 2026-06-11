@@ -16,4 +16,16 @@ describe('error-messages', () => {
     expect(renderError(null)).toBe(getErrorMessage('unknown'));
     expect(renderError({})).toBe(getErrorMessage('unknown'));
   });
+
+  // B39: producers append a status suffix / emit numeric WS codes that didn't
+  // match the table keys, so users saw raw codes instead of friendly text.
+  it('strips a trailing _<status> suffix to find the mapped message', () => {
+    expect(getErrorMessage('login_failed_401')).toBe(getErrorMessage('login_failed'));
+    expect(getErrorMessage('copilot_start_failed_500')).toBe(getErrorMessage('copilot_start_failed'));
+  });
+
+  it('maps WS aliases (max_reconnect, numeric 4001) to friendly text', () => {
+    expect(getErrorMessage('max_reconnect')).toBe(getErrorMessage('ws_max_reconnect'));
+    expect(renderError({ code: 4001 })).toBe(getErrorMessage('ws_auth_failed'));
+  });
 });

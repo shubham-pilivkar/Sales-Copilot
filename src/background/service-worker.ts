@@ -9,6 +9,7 @@ import {
   register,
   logout,
   refreshToken,
+  checkAudioConsent,
   recordAudioConsent,
   getPreferences,
   updatePreferences,
@@ -24,8 +25,19 @@ let meetingTabId: number | null = null;
 let prospectEmail = '';
 const wsClient = new CopilotWSClient();
 let pendingStart: { tabId: number; email: string } | null = null;
+// Synchronous re-entrancy guard: the IDLE/ERROR state check below runs before
+// several awaits (consent check, session create), so two near-simultaneous
+// START_COPILOT calls could both pass it and create two billed sessions.
+let starting = false;
+const CONTENT_SCRIPT_FILE = 'assets/meet-copilot.ts-loader.js';
 
-// Restore state on SW wake
+// Restore state on SW wake. Event listeners are registered synchronously and
+// can fire before this async restore completes, so they MUST await `ready`
+// first — otherwise GET_STATE/STOP/alarms act on a stale IDLE state and either
+// spawn a duplicate session, swallow a stop, or defeat the safety alarms.
+let markReady: () => void = () => {};
+const ready: Promise<void> = new Promise((resolve) => { markReady = resolve; });
+
 (async () => {
   try {
     const got = await chrome.storage.session.get([
@@ -39,9 +51,15 @@ let pendingStart: { tabId: number; email: string } | null = null;
       // If was active, attempt reconnect
       if (state === CopilotState.ACTIVE || state === CopilotState.RECONNECTING) {
         await reconnectWS();
+      } else if (state === CopilotState.CONNECTING) {
+        // A SW that died mid-connect can't recover the in-flight handshake;
+        // surface it as an error rather than getting stuck on "Connecting…".
+        setState(CopilotState.ERROR);
       }
     }
-  } catch { /* fresh session */ }
+  } catch { /* fresh session */ } finally {
+    markReady();
+  }
 })();
 
 // --- State Machine ---
@@ -76,6 +94,47 @@ function broadcastState(): void {
   if (meetingTabId) sendToTab(meetingTabId, payload);
 }
 
+async function wait(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function contentScriptReady(tabId: number): Promise<boolean> {
+  const response = await sendToTab(tabId, { type: MessageType.CONTENT_PING });
+  return Boolean(
+    response
+      && typeof response === 'object'
+      && 'ok' in response
+      && (response as { ok?: boolean }).ok,
+  );
+}
+
+async function ensureMeetContentScript(tabId: number): Promise<boolean> {
+  if (await contentScriptReady(tabId)) return true;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: [CONTENT_SCRIPT_FILE],
+    });
+  } catch (err) {
+    console.warn('[SW] Content script injection failed:', err);
+  }
+  await wait(150);
+  return contentScriptReady(tabId);
+}
+
+async function sendLifecycleToMeeting(phase: 'started' | 'stopped', sid?: string): Promise<void> {
+  if (!meetingTabId) return;
+  await ensureMeetContentScript(meetingTabId);
+  const result = await sendToTab(meetingTabId, {
+    type: MessageType.COPILOT_LIFECYCLE,
+    phase,
+    sessionId: sid,
+  });
+  if (result && typeof result === 'object' && 'ok' in result && !(result as { ok?: boolean }).ok) {
+    console.warn('[SW] Lifecycle message was not delivered:', result);
+  }
+}
+
 // --- WS Client Events ---
 
 wsClient.onStatusChange = (status: WSStatus) => {
@@ -105,7 +164,12 @@ wsClient.onProspectContext = (profile: ProspectProfile) => {
 };
 
 wsClient.onMeetingSummary = (summary: MeetingSummary) => {
-  if (meetingTabId) sendToTab(meetingTabId, { type: 'MEETING_SUMMARY', summary });
+  // The summary arrives during teardown, after meetingTabId may already be
+  // cleared — fall back to the tab retained for the post-stop grace window.
+  const tab = meetingTabId ?? summaryTabId;
+  if (tab) sendToTab(tab, { type: 'MEETING_SUMMARY', summary });
+  // Summary received — no need to keep the grace window open.
+  finishWsGraceClose();
 };
 
 wsClient.onError = (err: WSError) => {
@@ -158,10 +222,24 @@ async function closeOffscreen(): Promise<void> {
   try { await chrome.offscreen.closeDocument(); } catch { /* already closed */ }
 }
 
+// When the SW (re)starts capture, the offscreen runs its idempotent
+// stopCapture() first, which disconnects its old port. Without this guard the
+// port.onDisconnect handler would see that as a death and restart again —
+// an infinite loop. We suppress restart-on-disconnect for a short window
+// around any SW-initiated start.
+let expectPortChurn = false;
+let portChurnTimer: ReturnType<typeof setTimeout> | null = null;
+function suppressPortRestart(): void {
+  expectPortChurn = true;
+  if (portChurnTimer) clearTimeout(portChurnTimer);
+  portChurnTimer = setTimeout(() => { expectPortChurn = false; portChurnTimer = null; }, 4000);
+}
+
 async function startAudioCapture(): Promise<void> {
   if (!meetingTabId) return;
   const tabId = meetingTabId; // capture non-null before awaits reset narrowing
   try {
+    suppressPortRestart();
     await ensureOffscreen();
     // @types/chrome only declares the callback form; wrap it in a promise.
     const streamId = await new Promise<string>((resolve, reject) => {
@@ -188,49 +266,92 @@ async function stopAudioCapture(): Promise<void> {
 // --- Copilot Start/Stop ---
 
 async function startCopilot(tabId: number, email: string): Promise<void> {
+  if (starting) return;
   if (state !== CopilotState.IDLE && state !== CopilotState.ERROR) return;
-
-  // Check audio consent before capture. Local consent is required to proceed.
-  // Server-side consent is recorded async (non-blocking).
-  const consent = await chrome.storage.local.get(StorageKey.AUDIO_CONSENT);
-  if (!consent[StorageKey.AUDIO_CONSENT]) {
-    pendingStart = { tabId, email };
-    await chrome.storage.session.set({ [StorageKey.PENDING_START]: pendingStart });
-    try {
-      await chrome.windows.create({
-        url: chrome.runtime.getURL('src/permission/consent.html'),
-        type: 'popup',
-        width: 480,
-        height: 520,
-        focused: true,
-      });
-    } catch (err) {
-      console.error('[SW] Failed to open consent window:', err);
-    }
-    return; // User needs to grant consent first
-  }
-
-  setState(CopilotState.CONNECTING);
-  meetingTabId = tabId;
-  prospectEmail = email;
-
+  starting = true;
   try {
-    const { session_id, ws_url } = await startCopilotSession(email);
-    sessionId = session_id;
+    // Check local + server-side consent before opening a session or capture.
+    const consent = await chrome.storage.local.get(StorageKey.AUDIO_CONSENT);
+    const hasLocalConsent = consent[StorageKey.AUDIO_CONSENT] === true;
+    let serverReachable = true;
+    let hasServerConsent = false;
+    if (hasLocalConsent) {
+      try {
+        hasServerConsent = await checkAudioConsent();
+      } catch {
+        // Network/server failure — DON'T wipe a validly-recorded local consent
+        // and force a re-grant loop. Surface an error and bail.
+        serverReachable = false;
+      }
+    }
+    if (!serverReachable) {
+      notifyUser('consent_check_failed', 'Could not verify audio consent — check your connection and retry.');
+      return;
+    }
+    if (!hasLocalConsent || !hasServerConsent) {
+      if (!hasServerConsent) {
+        await chrome.storage.local.remove(StorageKey.AUDIO_CONSENT);
+      }
+      pendingStart = { tabId, email };
+      await chrome.storage.session.set({ [StorageKey.PENDING_START]: pendingStart });
+      try {
+        const consentWin = await chrome.windows.create({
+          url: chrome.runtime.getURL('src/permission/consent.html'),
+          type: 'popup',
+          width: 480,
+          height: 520,
+          focused: true,
+        });
+        // If the user closes the consent window without granting, clear the
+        // pending start so it can't silently auto-start a session much later.
+        const winId = consentWin?.id;
+        if (winId !== undefined) {
+          const onClosed = (closedId: number) => {
+            if (closedId !== winId) return;
+            chrome.windows.onRemoved.removeListener(onClosed);
+            if (pendingStart) {
+              pendingStart = null;
+              chrome.storage.session.remove(StorageKey.PENDING_START).catch(() => {});
+            }
+          };
+          chrome.windows.onRemoved.addListener(onClosed);
+        }
+      } catch (err) {
+        console.error('[SW] Failed to open consent window:', err);
+      }
+      return; // User needs to grant consent first
+    }
 
-    const token = (await chrome.storage.local.get(StorageKey.AUTH_TOKEN))[StorageKey.AUTH_TOKEN];
-    const baseUrl = (await chrome.storage.local.get(StorageKey.API_BASE_URL))[StorageKey.API_BASE_URL] || API_BASE_URL;
-    const wsBase = baseUrl.replace(/^http/, 'ws');
-    const serverWsUrl = ws_url || '';
-    const baseWsUrl = serverWsUrl.includes('localhost')
-      ? `${wsBase}/ws/copilot/${sessionId}`
-      : serverWsUrl || `${wsBase}/ws/copilot/${sessionId}`;
-    wsClient.connect(`${baseWsUrl}?token=${token}`);
+    // Assign session fields BEFORE setState so the persisted snapshot/broadcast
+    // for CONNECTING carries the real tab + email, not stale nulls.
+    meetingTabId = tabId;
+    prospectEmail = email;
+    setState(CopilotState.CONNECTING);
+    await sendLifecycleToMeeting('started');
 
-    if (meetingTabId) sendToTab(meetingTabId, { type: MessageType.COPILOT_LIFECYCLE, phase: 'started', sessionId: sessionId ?? undefined });
-  } catch (err) {
-    console.error('[SW] startCopilot failed:', err);
-    setState(CopilotState.ERROR);
+    try {
+      const { session_id, ws_url } = await startCopilotSession(email);
+      sessionId = session_id;
+
+      const token = (await chrome.storage.local.get(StorageKey.AUTH_TOKEN))[StorageKey.AUTH_TOKEN];
+      if (!token) throw new Error('not_authenticated');
+      const baseUrl = (await chrome.storage.local.get(StorageKey.API_BASE_URL))[StorageKey.API_BASE_URL] || API_BASE_URL;
+      const wsBase = baseUrl.replace(/^http/, 'ws');
+      const serverWsUrl = ws_url || '';
+      const baseWsUrl = serverWsUrl.includes('localhost')
+        ? `${wsBase}/ws/copilot/${sessionId}`
+        : serverWsUrl || `${wsBase}/ws/copilot/${sessionId}`;
+      wsClient.connect(`${baseWsUrl}?token=${encodeURIComponent(token)}`);
+
+      await sendLifecycleToMeeting('started', sessionId ?? undefined);
+    } catch (err) {
+      console.error('[SW] startCopilot failed:', err);
+      setState(CopilotState.ERROR);
+      // Tell the meeting tab to tear down its overlay so it doesn't leak.
+      await sendLifecycleToMeeting('stopped');
+    }
+  } finally {
+    starting = false;
   }
 }
 
@@ -240,7 +361,11 @@ async function stopCopilot(): Promise<void> {
   startForceStopAlarm(); // #7: timeout safety net
 
   wsClient.sendJSON({ type: WSMessageType.SESSION_STOP });
-  wsClient.close();
+  // Don't close the socket immediately: the backend generates and sends the
+  // meeting_summary during teardown (a few seconds later). Keep the WS open for
+  // a short grace window so that summary can arrive, then close.
+  summaryTabId = meetingTabId;
+  scheduleWsGraceClose();
   await stopAudioCapture();
   stopHeartbeatMonitor(); // #5: stop monitoring
 
@@ -248,7 +373,7 @@ async function stopCopilot(): Promise<void> {
     stopCopilotSession(sessionId).catch(() => {});
   }
   if (meetingTabId) {
-    sendToTab(meetingTabId, { type: MessageType.COPILOT_LIFECYCLE, phase: 'stopped' });
+    await sendLifecycleToMeeting('stopped');
   }
 
   sessionId = null;
@@ -258,18 +383,37 @@ async function stopCopilot(): Promise<void> {
   setState(CopilotState.IDLE);
 }
 
+// --- WS grace close (keep socket briefly open to receive meeting_summary) ---
+let summaryTabId: number | null = null;
+let wsGraceTimer: ReturnType<typeof setTimeout> | null = null;
+const WS_GRACE_CLOSE_MS = 8000;
+
+function scheduleWsGraceClose(): void {
+  if (wsGraceTimer) clearTimeout(wsGraceTimer);
+  wsGraceTimer = setTimeout(finishWsGraceClose, WS_GRACE_CLOSE_MS);
+}
+
+function finishWsGraceClose(): void {
+  if (wsGraceTimer) { clearTimeout(wsGraceTimer); wsGraceTimer = null; }
+  summaryTabId = null;
+  wsClient.close();
+}
+
 // --- Message Router ---
 
 onMessage({
   [MessageType.START_COPILOT]: async (msg) => {
+    await ready;
     await startCopilot(msg.tabId, msg.prospectEmail);
   },
   [MessageType.STOP_COPILOT]: async () => {
+    await ready;
     await stopCopilot();
   },
-  [MessageType.GET_STATE]: (): CopilotStateSnapshot => ({
-    state, sessionId, prospectEmail, meetingTabId,
-  }),
+  [MessageType.GET_STATE]: async (): Promise<CopilotStateSnapshot> => {
+    await ready;
+    return { state, sessionId, prospectEmail, meetingTabId };
+  },
   [MessageType.LOGIN]: async (msg) => {
     return login(msg.email, msg.password);
   },
@@ -277,6 +421,7 @@ onMessage({
     return register(msg.email, msg.name, msg.password);
   },
   [MessageType.LOGOUT]: async () => {
+    await ready;
     await stopCopilot();
     await logout();
   },
@@ -287,11 +432,11 @@ onMessage({
     return updatePreferences(msg.preferences);
   },
   [MessageType.AUDIO_CONSENT_GRANTED]: async () => {
-    // Set local consent immediately (always succeeds)
+    await ready;
+    // Record server-side consent first. The backend refuses session_start
+    // without this audit record, so this must not be best-effort.
+    await recordAudioConsent();
     await chrome.storage.local.set({ [StorageKey.AUDIO_CONSENT]: true });
-
-    // Record server-side consent (best-effort, don't block session start)
-    recordAudioConsent().catch(() => {});
 
     // Resume pending session start
     const stored = await chrome.storage.session.get(StorageKey.PENDING_START);
@@ -304,7 +449,8 @@ onMessage({
     }
     return { resumed: false };
   },
-  [MessageType.MEETING_DETECTED]: (msg, sender) => {
+  [MessageType.MEETING_DETECTED]: async (msg, sender) => {
+    await ready;
     const tid = sender?.tab?.id || msg.tabId;
     // Don't repoint an in-progress session to a different Meet tab — that would
     // misroute nudges/transcripts away from the live call.
@@ -314,7 +460,12 @@ onMessage({
     }
     if (tid) meetingTabId = tid;
   },
-  [MessageType.MEETING_ENDED]: async () => {
+  [MessageType.MEETING_ENDED]: async (_msg, sender) => {
+    await ready;
+    // Only the tab hosting the active session may end it. Otherwise leaving an
+    // unrelated second Meet tab would tear down the live call.
+    const tid = sender?.tab?.id;
+    if (meetingTabId && tid && tid !== meetingTabId) return;
     await stopCopilot();
   },
   [MessageType.MIC_MUTE_STATE]: (msg) => {
@@ -367,6 +518,18 @@ function notifyUser(code: string, message: string): void {
 const SOURCE_MIC = 0x01;
 const SOURCE_TAB = 0x02;
 
+// Decode base64 PCM sent by the offscreen document over the runtime port.
+function base64ToUint8Array(b64: string): Uint8Array {
+  try {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  } catch {
+    return new Uint8Array(0);
+  }
+}
+
 // #5: Offscreen heartbeat monitoring via chrome.alarms
 const HEARTBEAT_ALARM = 'sc_heartbeat_check';
 // chrome.alarms clamps periodInMinutes to a 1-minute minimum in packed builds,
@@ -380,14 +543,26 @@ let lastHeartbeatAt = 0;
 const FORCE_STOP_ALARM = 'sc_force_stop';
 const FORCE_STOP_TIMEOUT_MIN = 2; // 2 min max for stop
 
-chrome.alarms.onAlarm.addListener((alarm) => {
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  await ready;
   if (alarm.name === HEARTBEAT_ALARM) {
-    // #5: Check if offscreen is alive
-    if (state === CopilotState.ACTIVE && lastHeartbeatAt > 0) {
-      if (Date.now() - lastHeartbeatAt > HEARTBEAT_TIMEOUT_MS) {
-        console.warn('[SW] Offscreen heartbeat timeout — restarting capture');
+    if (state !== CopilotState.ACTIVE) return;
+    if (lastHeartbeatAt === 0) {
+      // SW restarted: in-memory heartbeat is lost. Don't silently skip the
+      // check (the old bug) — verify the offscreen document actually exists and
+      // restart capture if it's gone.
+      const alive = await chrome.offscreen.hasDocument().catch(() => false);
+      if (!alive) {
+        console.warn('[SW] No offscreen document after SW restart — restarting capture');
         startAudioCapture().catch(() => {});
+      } else {
+        lastHeartbeatAt = Date.now(); // assume alive; let normal timeout logic take over
       }
+      return;
+    }
+    if (Date.now() - lastHeartbeatAt > HEARTBEAT_TIMEOUT_MS) {
+      console.warn('[SW] Offscreen heartbeat timeout — restarting capture');
+      startAudioCapture().catch(() => {});
     }
   } else if (alarm.name === FORCE_STOP_ALARM) {
     // #7: Force cleanup if stop is taking too long
@@ -418,11 +593,12 @@ function clearForceStopAlarm(): void {
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'audio-stream') return;
-  port.onMessage.addListener((msg: { type?: string; data?: ArrayBuffer; source?: string }) => {
-    if (msg.type === 'audio_chunk' && msg.data) {
-      // msg.data is an ArrayBuffer (transferred from offscreen)
+  port.onMessage.addListener((msg: { type?: string; data?: string; source?: string }) => {
+    if (msg.type === 'audio_chunk' && typeof msg.data === 'string' && msg.data.length > 0) {
+      // msg.data is base64 PCM (ports JSON-serialize, so it can't be a raw buffer).
       const sourceTag = msg.source === 'mic' ? SOURCE_MIC : SOURCE_TAB;
-      const audio = new Uint8Array(msg.data);
+      const audio = base64ToUint8Array(msg.data);
+      if (audio.length === 0) return;
       const tagged = new Uint8Array(1 + audio.length);
       tagged[0] = sourceTag;
       tagged.set(audio, 1);
@@ -430,6 +606,7 @@ chrome.runtime.onConnect.addListener((port) => {
     }
   });
   port.onDisconnect.addListener(() => {
+    if (expectPortChurn) return; // expected churn from a SW-initiated (re)start
     if (state === CopilotState.ACTIVE) {
       console.warn('[SW] Audio port disconnected — restarting capture');
       startAudioCapture().catch(() => {});
@@ -438,7 +615,8 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 // Tab close → auto-stop
-chrome.tabs.onRemoved.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await ready;
   if (tabId === meetingTabId) stopCopilot();
 });
 

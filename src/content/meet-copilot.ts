@@ -2,7 +2,7 @@
 
 import { MessageType } from '../constants.js';
 import { sendMessage, onMessage } from '../lib/messaging.js';
-import type { Nudge, ProspectProfile } from '../types/ws.js';
+import type { Nudge, ProspectProfile, MeetingSummary } from '../types/ws.js';
 
 // --- Build Stamp (#9) ---
 const BUILD_STAMP = Date.now().toString(36);
@@ -258,6 +258,7 @@ let shadowHost: HTMLElement | null = null;
 let shadowRoot: ShadowRoot | null = null;
 let nudgeContainer: HTMLElement | null = null;
 let minimized = false;
+let keydownHandler: ((e: KeyboardEvent) => void) | null = null;
 let prospectData: ProspectProfile | null = null;
 let nudgeCount = 0;
 
@@ -384,13 +385,17 @@ function createOverlay(): void {
   root.getElementById('minimize-btn')?.addEventListener('click', () => toggleMinimize(true));
   root.getElementById('copilot-pill')?.addEventListener('click', () => toggleMinimize(false));
 
-  // G2: Keyboard shortcut — Esc to dismiss top nudge
-  document.addEventListener('keydown', (e: KeyboardEvent) => {
+  // G2: Keyboard shortcut — Esc to dismiss top nudge. Store the handler so
+  // removeOverlay can detach it; otherwise each create/remove cycle stacks
+  // another listener and a single Esc dismisses N nudges at once.
+  if (keydownHandler) document.removeEventListener('keydown', keydownHandler);
+  keydownHandler = (e: KeyboardEvent) => {
     if (e.key === 'Escape' && copilotActive && !minimized) {
       const first = nudgeContainer?.querySelector('.nudge-card');
       if (first) dismissNudge(first as HTMLElement);
     }
-  });
+  };
+  document.addEventListener('keydown', keydownHandler);
 }
 
 // G1: Toggle minimize
@@ -410,6 +415,10 @@ function autoExpandIfNeeded(priority?: string): void {
 }
 
 function removeOverlay(): void {
+  if (keydownHandler) {
+    document.removeEventListener('keydown', keydownHandler);
+    keydownHandler = null;
+  }
   if (shadowHost) {
     shadowHost.remove();
     shadowHost = null;
@@ -555,9 +564,38 @@ function escapeHtml(s: string): string {
   return div.innerHTML;
 }
 
+// Render the end-of-meeting summary as a persistent card in the overlay so the
+// backend's generated summary is actually surfaced to the rep.
+function showMeetingSummary(summary: MeetingSummary): void {
+  const container = nudgeContainer;
+  if (!container) return;
+  const empty = container.querySelector('.empty');
+  if (empty) empty.remove();
+
+  const list = (items?: string[]) =>
+    (items && items.length)
+      ? `<ul>${items.slice(0, 5).map((i) => `<li>${escapeHtml(i)}</li>`).join('')}</ul>`
+      : '';
+
+  const card = document.createElement('div');
+  card.className = 'nudge-card priority-high meeting-summary-card';
+  card.innerHTML = `
+    <div class="nudge-title">Meeting summary</div>
+    ${summary.key_points?.length ? `<div class="nudge-message"><strong>Key points</strong>${list(summary.key_points)}</div>` : ''}
+    ${summary.objections?.length ? `<div class="nudge-message"><strong>Objections</strong>${list(summary.objections)}</div>` : ''}
+    ${summary.action_items?.length ? `<div class="nudge-message"><strong>Action items</strong>${list(summary.action_items)}</div>` : ''}
+    ${summary.next_steps ? `<div class="nudge-message"><strong>Next steps:</strong> ${escapeHtml(summary.next_steps)}</div>` : ''}
+    ${typeof summary.qualification_score === 'number' ? `<div class="nudge-message"><strong>Qualification:</strong> ${Math.round(summary.qualification_score)}/100</div>` : ''}
+  `;
+  container.prepend(card);
+  container.scrollTop = 0;
+  updateStatus('Meeting summary ready');
+}
+
 // --- Message Handlers ---
 
 onMessage({
+  [MessageType.CONTENT_PING]: () => ({ ready: true }),
   [MessageType.COPILOT_LIFECYCLE]: (msg) => {
     if (msg.phase === 'started') {
       copilotActive = true;
@@ -587,8 +625,14 @@ onMessage({
     showProspectBrief(msg.profile);
   },
   WS_ERROR: (msg) => {
-    updateStatus(msg.code === 'max_reconnect' ? 'Disconnected' : 'Reconnecting...');
+    // Terminal codes (gave up reconnecting, or auth rejected) shouldn't show a
+    // perpetual "Reconnecting…" — the connection is dead.
+    const terminal = msg.code === 'max_reconnect' || msg.code === 4001 || msg.code === 'auth';
+    updateStatus(terminal ? 'Disconnected' : 'Reconnecting...');
     showOfflineBanner(true);
+  },
+  MEETING_SUMMARY: (msg) => {
+    if (msg.summary) showMeetingSummary(msg.summary);
   },
   [MessageType.COPILOT_NOTICE]: (msg) => {
     // Non-fatal user-facing notice (e.g. autoplay blocked, capture failed).

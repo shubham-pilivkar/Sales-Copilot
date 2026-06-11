@@ -9,6 +9,11 @@ export default defineConfig({
       input: {
         offscreen: 'src/offscreen/offscreen.html',
       },
+      output: {
+        entryFileNames: 'assets/[name].js',
+        chunkFileNames: 'assets/[name].js',
+        assetFileNames: 'assets/[name][extname]',
+      },
     },
   },
 });

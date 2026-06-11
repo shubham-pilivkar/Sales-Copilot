@@ -51,6 +51,9 @@ export class CopilotWSClient {
 
   /** Connect to the copilot WebSocket. `url` includes session_id + token query. */
   connect(url: string): void {
+    // Kill any pending reconnect/ping timers from a previous lifecycle so a
+    // stale timer can't spawn a second parallel socket after this connect.
+    this._clearTimers();
     this._url = url;
     this._intentionalClose = false;
     this._reconnectAttempt = 0;
@@ -75,24 +78,40 @@ export class CopilotWSClient {
   close(): void {
     this._intentionalClose = true;
     this._clearTimers();
-    if (this._ws) {
-      this._ws.close(1000, 'client_stop');
-      this._ws = null;
-    }
+    // Detach handlers before closing so this socket's late onclose can't run
+    // _onClose and (e.g.) null out a newer socket or schedule a reconnect.
+    this._teardownSocket();
     this._setStatus('closed');
   }
 
   // --- Internal ---
 
+  /** Detach handlers from and close the current socket, then drop the reference. */
+  private _teardownSocket(): void {
+    const ws = this._ws;
+    if (!ws) return;
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    try { ws.close(1000, 'superseded'); } catch { /* already closing */ }
+    this._ws = null;
+  }
+
   private _doConnect(): void {
+    // Supersede any existing socket so two connections never run in parallel.
+    this._teardownSocket();
     this._setStatus(this._reconnectAttempt > 0 ? 'reconnecting' : 'connecting');
     try {
-      this._ws = new WebSocket(this._url);
-      this._ws.binaryType = 'arraybuffer';
-      this._ws.onopen = () => this._onOpen();
-      this._ws.onmessage = (ev) => this._onMessage(ev);
-      this._ws.onclose = (ev) => this._onClose(ev);
-      this._ws.onerror = () => {}; // onclose always follows
+      const ws = new WebSocket(this._url);
+      this._ws = ws;
+      ws.binaryType = 'arraybuffer';
+      // Identity-guard every handler: if `ws` is no longer the current socket
+      // (superseded by a reconnect/new connect), ignore its late events.
+      ws.onopen = () => { if (ws === this._ws) this._onOpen(); };
+      ws.onmessage = (ev) => { if (ws === this._ws) this._onMessage(ev); };
+      ws.onclose = (ev) => { if (ws === this._ws) this._onClose(ev); };
+      ws.onerror = () => {}; // onclose always follows
     } catch {
       this._scheduleReconnect();
     }

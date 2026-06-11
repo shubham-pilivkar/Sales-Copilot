@@ -29,13 +29,30 @@ const ERROR_MESSAGES: Record<string, string> = {
   unknown: 'Something went wrong. Please try again.',
 };
 
+// Aliases for codes the producers actually emit that don't match table keys.
+const CODE_ALIASES: Record<string, string> = {
+  max_reconnect: 'ws_max_reconnect',
+  '4001': 'ws_auth_failed',
+  auth: 'ws_auth_failed',
+};
+
+/** Normalize a raw code to a table key: strip a trailing `_<status>` (e.g.
+ *  `login_failed_401` → `login_failed`) and apply known aliases. */
+function normalizeCode(code: string): string {
+  if (ERROR_MESSAGES[code]) return code;
+  if (CODE_ALIASES[code]) return CODE_ALIASES[code];
+  const stripped = code.replace(/_\d+$/, '');
+  return ERROR_MESSAGES[stripped] ? stripped : code;
+}
+
 /** Get a user-friendly error message for a code. */
 export function getErrorMessage(code: string): string {
-  return ERROR_MESSAGES[code] || ERROR_MESSAGES.unknown;
+  return ERROR_MESSAGES[normalizeCode(code)] || ERROR_MESSAGES.unknown;
 }
 
 /** Render an error message string from a backend error event. */
-export function renderError(error: { code?: string; message?: string } | null | undefined): string {
+export function renderError(error: { code?: string | number; message?: string } | null | undefined): string {
   if (!error) return ERROR_MESSAGES.unknown;
-  return (error.code ? ERROR_MESSAGES[error.code] : undefined) || error.message || ERROR_MESSAGES.unknown;
+  const code = error.code !== undefined ? String(error.code) : undefined;
+  return (code ? ERROR_MESSAGES[normalizeCode(code)] : undefined) || error.message || ERROR_MESSAGES.unknown;
 }

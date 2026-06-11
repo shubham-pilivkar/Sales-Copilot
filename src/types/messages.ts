@@ -45,6 +45,7 @@ export type CopilotLifecycleMsg = {
   sessionId?: string;
 };
 export type CopilotNoticeMsg = { type: 'COPILOT_NOTICE'; code: string; message: string };
+export type ContentPingMsg = { type: 'CONTENT_PING' };
 
 // --- SW → content (render messages; raw string types) ---
 export type NudgeMsg = { type: 'NUDGE'; nudge: Nudge };
@@ -85,6 +86,7 @@ export type ExtMessage =
   | StateUpdateMsg
   | CopilotLifecycleMsg
   | CopilotNoticeMsg
+  | ContentPingMsg
   | NudgeMsg
   | TranscriptMsg
   | StageUpdateMsg

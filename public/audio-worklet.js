@@ -42,7 +42,21 @@ class CopilotAudioProcessor extends AudioWorkletProcessor {
     const input = inputs[0];
     if (!input || !input[0]) return true;
 
-    const block = input[0];
+    // Downmix all channels to mono. Reading only channel 0 (the old behaviour)
+    // dropped audio panned to other channels — common for stereo tab capture.
+    let block;
+    const channels = input.length;
+    if (channels > 1) {
+      const n = input[0].length;
+      block = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        let sum = 0;
+        for (let c = 0; c < channels; c++) sum += input[c][i] || 0;
+        block[i] = sum / channels;
+      }
+    } else {
+      block = input[0];
+    }
     const L = block.length;
     const ratio = this._ratio;
     // sampleAt(-1) -> previous block's last sample; sampleAt(i) -> block[i].

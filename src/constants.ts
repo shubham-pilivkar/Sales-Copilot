@@ -63,6 +63,7 @@ export const MessageType = Object.freeze({
   // SW → content
   COPILOT_LIFECYCLE: 'COPILOT_LIFECYCLE',
   COPILOT_NOTICE: 'COPILOT_NOTICE', // SW → content/popup: non-fatal user-facing notice
+  CONTENT_PING: 'CONTENT_PING',
   // Content → SW
   MEETING_DETECTED: 'MEETING_DETECTED',
   MEETING_ENDED: 'MEETING_ENDED',

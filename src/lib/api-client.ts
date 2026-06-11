@@ -66,6 +66,17 @@ async function requestWithTimeout(path: string, init: ReqInit = {}, timeoutMs = 
   }
 }
 
+/** Raw fetch (no auth/refresh) with an abort timeout — for unauthenticated calls. */
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 10_000): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export class AuthError extends Error {
   constructor() {
     super('auth_expired');
@@ -77,7 +88,7 @@ export class AuthError extends Error {
 
 export async function login(email: string, password: string): Promise<AuthResponse> {
   const baseUrl = await getBaseUrl();
-  const res = await fetch(`${baseUrl}/api/v1/auth/login`, {
+  const res = await fetchWithTimeout(`${baseUrl}/api/v1/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, password }),
@@ -97,7 +108,7 @@ export async function login(email: string, password: string): Promise<AuthRespon
 
 export async function register(email: string, name: string, password: string): Promise<AuthResponse> {
   const baseUrl = await getBaseUrl();
-  const res = await fetch(`${baseUrl}/api/v1/auth/register`, {
+  const res = await fetchWithTimeout(`${baseUrl}/api/v1/auth/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, name, password }),
@@ -144,7 +155,9 @@ export async function refreshToken(): Promise<string | null> {
 }
 
 export async function checkAudioConsent(): Promise<boolean> {
-  const res = await request('/api/v1/auth/consent', { method: 'GET' });
+  // Timeout: this is awaited synchronously in the copilot-start flow, so a hung
+  // backend would otherwise stall start with no feedback.
+  const res = await requestWithTimeout('/api/v1/auth/consent', { method: 'GET' });
   if (!res.ok) return false;
   const data = await res.json().catch(() => ({}));
   return data.has_consent === true;

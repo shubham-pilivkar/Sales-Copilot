@@ -10,7 +10,6 @@ const HEAP_LIMIT_MB = 200; // Warn if heap exceeds this
 let audioContext: AudioContext | null = null;
 let tabStream: MediaStream | null = null;
 let micStream: MediaStream | null = null;
-let monitorStream: MediaStream | null = null;
 let port: chrome.runtime.Port | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -77,27 +76,14 @@ async function startCapture(streamId: string): Promise<void> {
     } as unknown as MediaStreamConstraints;
     const tab = await navigator.mediaDevices.getUserMedia(tabConstraints);
     tabStream = tab;
-
-    // Keep tab audio audible to the user (handle autoplay policy)
-    const monitorEl = document.getElementById('tab-monitor') as HTMLAudioElement | null;
-    if (monitorEl) {
-      // Keep a reference to the clone so stopCapture can stop its tracks —
-      // stopping the original's tracks does NOT stop a clone, so without this
-      // the tab-capture indicator stays on and a track leaks per restart.
-      monitorStream = tab.clone();
-      monitorEl.srcObject = monitorStream;
-      const playPromise = monitorEl.play();
-      if (playPromise) {
-        playPromise.catch(() => {
-          // #10: Autoplay blocked — notify SW so popup can show user action needed
-          chrome.runtime.sendMessage({ type: MessageType.MONITOR_BLOCKED }).catch(() => {});
-          // Retry on user interaction
-          document.addEventListener('click', () => {
-            monitorEl.play().catch(() => {});
-          }, { once: true });
-        });
-      }
-    }
+    // NOTE: tab playback is wired later via the Web Audio graph
+    // (tabSource → ctx.destination). We deliberately do NOT clone the tab
+    // stream into a separate <audio> element — cloning a tabCapture stream is a
+    // known Chrome issue that silently breaks the capture tap (the worklet goes
+    // silent) or breaks playback. The official pattern feeds ONE
+    // MediaStreamSource into both the destination and the worklet.
+    // Refs: developer.chrome.com screen-capture guide; chromium-extensions
+    // thread "can't maintain both playback and transcription".
 
     // 2. Capture mic (user's voice)
     let mic: MediaStream | null = null;
@@ -111,6 +97,17 @@ async function startCapture(streamId: string): Promise<void> {
     // 3. Create AudioContext at target sample rate
     const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
     audioContext = ctx;
+
+    // Autoplay policy can start the context suspended; without resuming, no node
+    // (including the tab/mic worklets) processes audio. Resume; if still blocked,
+    // ask the user to interact and retry (replaces the old <audio> autoplay path).
+    if (ctx.state === 'suspended') {
+      try { await ctx.resume(); } catch { /* fall through to click-to-resume */ }
+      if (ctx.state === 'suspended') {
+        chrome.runtime.sendMessage({ type: MessageType.MONITOR_BLOCKED }).catch(() => {});
+        document.addEventListener('click', () => { ctx.resume().catch(() => {}); }, { once: true });
+      }
+    }
 
     // 4. Load AudioWorklet
     const workletUrl = chrome.runtime.getURL('public/audio-worklet.js');
@@ -133,6 +130,10 @@ async function startCapture(streamId: string): Promise<void> {
     const workletOpts: AudioWorkletNodeOptions = { processorOptions: { targetRate: SAMPLE_RATE } };
 
     const tabSource = ctx.createMediaStreamSource(tab);
+    // Playback path: keep tab audio audible. Connecting the source directly to
+    // the destination is what stops Chrome muting the captured tab audio, and it
+    // leaves the same source available to tap into the worklet below.
+    tabSource.connect(ctx.destination);
     const tabWorklet = new AudioWorkletNode(ctx, 'copilot-audio-processor', workletOpts);
     tabWorklet.port.onmessage = (ev: MessageEvent) => {
       // Re-read `port` at call time — stopCapture() may have nulled it.
@@ -178,9 +179,6 @@ function stopCapture(): void {
   if (audioContext) { audioContext.close().catch(() => {}); audioContext = null; }
   if (tabStream) { tabStream.getTracks().forEach((t) => t.stop()); tabStream = null; }
   if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
-  if (monitorStream) { monitorStream.getTracks().forEach((t) => t.stop()); monitorStream = null; }
-  const monitorEl = document.getElementById('tab-monitor') as HTMLAudioElement | null;
-  if (monitorEl) monitorEl.srcObject = null;
   if (port) { port.disconnect(); port = null; }
   console.info('[Offscreen] Audio capture stopped');
 }

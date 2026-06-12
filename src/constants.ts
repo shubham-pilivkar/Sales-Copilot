@@ -78,6 +78,13 @@ export const MessageType = Object.freeze({
   OFFSCREEN_CAPTURE_FAILED: 'OFFSCREEN_CAPTURE_FAILED',
   MONITOR_BLOCKED: 'MONITOR_BLOCKED',
   MIC_MUTE_STATE: 'MIC_MUTE_STATE',
+  // Audio health (offscreen → SW → content/popup)
+  MIC_UNAVAILABLE: 'MIC_UNAVAILABLE',           // mic permission missing/denied — user action needed
+  AUDIO_PLAYBACK_SUSPENDED: 'AUDIO_PLAYBACK_SUSPENDED', // AudioContext suspended — needs resume
+  RESUME_AUDIO_PLAYBACK: 'RESUME_AUDIO_PLAYBACK',       // content/popup → SW → offscreen: retry ctx.resume()
+  AUDIO_STATUS: 'AUDIO_STATUS',                 // SW → content/popup: {mic, tab, playback} health snapshot
+  GET_AUDIO_STATUS: 'GET_AUDIO_STATUS',         // popup → SW: request current snapshot
+  OPEN_CONSENT_PAGE: 'OPEN_CONSENT_PAGE',       // content/popup → SW: reopen mic-permission page
 } as const);
 export type MessageType = (typeof MessageType)[keyof typeof MessageType];
 

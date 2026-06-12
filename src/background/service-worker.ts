@@ -210,8 +210,10 @@ async function ensureOffscreen(): Promise<void> {
     if (existing) return;
     await chrome.offscreen.createDocument({
       url: 'src/offscreen/offscreen.html',
-      reasons: [chrome.offscreen.Reason.USER_MEDIA],
-      justification: 'Capture meeting audio for AI sales copilot',
+      // AUDIO_PLAYBACK: the offscreen doc also plays the captured tab audio
+      // back to the user (capture mutes the tab), not just captures it.
+      reasons: [chrome.offscreen.Reason.USER_MEDIA, chrome.offscreen.Reason.AUDIO_PLAYBACK],
+      justification: 'Capture meeting audio for AI sales copilot and keep it audible to the user',
     });
   } catch (err) {
     console.error('[SW] ensureOffscreen failed:', err);
@@ -240,6 +242,12 @@ async function startAudioCapture(): Promise<void> {
   const tabId = meetingTabId; // capture non-null before awaits reset narrowing
   try {
     suppressPortRestart();
+    // Fresh audio-health slate for this capture attempt
+    audioStatus.mic = false; audioStatus.tab = false; audioStatus.playback = true;
+    audioStatus.micReason = undefined;
+    audioStatus.micBytes = 0; audioStatus.tabBytes = 0;
+    audioStatus.micFlowDead = false; audioStatus.tabFlowDead = false;
+    lastFlowCheck = { mic: 0, tab: 0, at: 0 };
     await ensureOffscreen();
     // @types/chrome only declares the callback form; wrap it in a promise.
     const streamId = await new Promise<string>((resolve, reject) => {
@@ -447,6 +455,15 @@ onMessage({
       await startCopilot(start.tabId, start.email);
       return { resumed: true };
     }
+    // Mid-session grant (user clicked "Mic off — click to enable" during an
+    // ACTIVE session and granted the permission): restart capture in place so
+    // the now-granted mic actually goes live. Without this, the indicator
+    // stays "off" until the next session — a dead-end fix loop.
+    if (state === CopilotState.ACTIVE) {
+      audioStatus.micReason = undefined;
+      await startAudioCapture().catch(() => {});
+      return { resumed: false, micRestarted: true };
+    }
     return { resumed: false };
   },
   [MessageType.MEETING_DETECTED]: async (msg, sender) => {
@@ -490,13 +507,59 @@ onMessage({
       nudge_type: msg.nudge_type,
     });
   },
-  [MessageType.OFFSCREEN_READY]: () => {
+  [MessageType.OFFSCREEN_READY]: (msg) => {
     lastHeartbeatAt = Date.now();
+    // Heartbeats carry an audio-health snapshot — fold it into our status.
+    // Track liveness can only DOWNGRADE flow flags (dead track = dead flow),
+    // never upgrade them: a live track with zero bytes is still a dead
+    // pipeline, and overriding the watchdog here would cause notification
+    // flapping (watchdog flags dead → heartbeat flips back → re-notify).
+    const audio = (msg as { audio?: { contextState?: string; mic?: boolean; tab?: boolean } })?.audio;
+    if (audio) {
+      audioStatus.mic = audio.mic === true && !audioStatus.micFlowDead;
+      audioStatus.tab = audio.tab === true && !audioStatus.tabFlowDead;
+      audioStatus.playback = audio.contextState === 'running';
+      broadcastAudioStatus();
+    }
     console.info('[SW] Offscreen ready');
   },
   [MessageType.MONITOR_BLOCKED]: () => {
     // Autoplay policy blocked meeting audio playback — tell the user to click.
     notifyUser('monitor_blocked', 'Click the meeting tab to enable audio.');
+  },
+  [MessageType.MIC_UNAVAILABLE]: (msg) => {
+    // Mic permission missing/denied: offscreen documents can't prompt, so the
+    // user must grant it via the consent page. Surface an actionable notice.
+    audioStatus.mic = false;
+    audioStatus.micReason = (msg as { reason?: string })?.reason || 'unknown';
+    broadcastAudioStatus();
+    notifyUser(
+      'mic_unavailable',
+      'Microphone is not captured — your own speech won\'t generate insights. Click the mic indicator to grant access.',
+    );
+  },
+  [MessageType.AUDIO_PLAYBACK_SUSPENDED]: () => {
+    // The offscreen AudioContext is suspended — meeting audio is muted for the
+    // user. The overlay shows a clickable "enable audio" action.
+    audioStatus.playback = false;
+    broadcastAudioStatus();
+    notifyUser('playback_suspended', 'Meeting audio is paused — click "Enable audio" in the assistant panel.');
+  },
+  [MessageType.RESUME_AUDIO_PLAYBACK]: () => {
+    // No relay needed: chrome.runtime.sendMessage from the overlay/popup is
+    // delivered to ALL extension contexts including the offscreen document,
+    // which handles it directly. Relaying here would run resumePlayback twice.
+    // This handler just ACKs the message.
+  },
+  [MessageType.GET_AUDIO_STATUS]: () => ({ ...audioStatus }),
+  [MessageType.OPEN_CONSENT_PAGE]: async () => {
+    await chrome.windows.create({
+      url: chrome.runtime.getURL('src/permission/consent.html'),
+      type: 'popup',
+      width: 480,
+      height: 560,
+      focused: true,
+    }).catch(() => {});
   },
   [MessageType.OFFSCREEN_CAPTURE_FAILED]: (msg) => {
     // Audio capture could not start — surface it and don't pretend we're ACTIVE.
@@ -517,6 +580,80 @@ function notifyUser(code: string, message: string): void {
 
 const SOURCE_MIC = 0x01;
 const SOURCE_TAB = 0x02;
+
+// --- Audio health status (Phase D diagnostics) ---
+// Tracks what's actually flowing so silent failures (dead mic, muted playback,
+// no tab audio) surface to the user instead of looking like a healthy session.
+const audioStatus: {
+  mic: boolean; tab: boolean; playback: boolean; micReason?: string;
+  micBytes: number; tabBytes: number;
+  // Set by the flow watchdog when bytes stop; only actual byte flow clears
+  // them. Heartbeat snapshots (track liveness) must NOT override these —
+  // a live track with zero bytes is still a dead pipeline.
+  micFlowDead: boolean; tabFlowDead: boolean;
+} = { mic: false, tab: false, playback: true, micBytes: 0, tabBytes: 0, micFlowDead: false, tabFlowDead: false };
+
+function broadcastAudioStatus(): void {
+  const payload = {
+    type: MessageType.AUDIO_STATUS,
+    mic: audioStatus.mic,
+    tab: audioStatus.tab,
+    playback: audioStatus.playback,
+    micReason: audioStatus.micReason,
+  };
+  if (meetingTabId) sendToTab(meetingTabId, payload);
+  chrome.runtime.sendMessage(payload).catch(() => {});
+}
+
+// Flow watchdog: while ACTIVE, if a source produces zero bytes over a full
+// check window, flag it (edge-triggered: notify once on stop, clear on resume).
+// Note: a muted mic still produces frames of digital silence (bytes flow);
+// zero bytes means the capture path itself is dead.
+let lastFlowCheck = { mic: 0, tab: 0, at: 0 };
+// Throttle no-flow notices: remediation restarts reset the flow flags, so a
+// persistently-dead source would otherwise re-notify on every tick.
+let lastNoFlowNotifyAt = 0;
+const NO_FLOW_NOTIFY_INTERVAL_MS = 5 * 60_000;
+
+function checkAudioFlow(): void {
+  if (state !== CopilotState.ACTIVE) { lastFlowCheck = { mic: 0, tab: 0, at: 0 }; return; }
+  const now = Date.now();
+  if (lastFlowCheck.at > 0) {
+    const tabFlowed = audioStatus.tabBytes > lastFlowCheck.tab;
+    const micFlowed = audioStatus.micBytes > lastFlowCheck.mic;
+    const mayNotify = now - lastNoFlowNotifyAt > NO_FLOW_NOTIFY_INTERVAL_MS;
+    let changed = false;
+    if (!tabFlowed && !audioStatus.tabFlowDead) {
+      audioStatus.tabFlowDead = true;
+      audioStatus.tab = false; changed = true;
+      if (mayNotify) {
+        lastNoFlowNotifyAt = now;
+        notifyUser('no_tab_audio', 'Meeting audio stopped flowing — restarting capture.');
+      }
+      // Remediate, don't just report: a dead tab flow means the pipeline is
+      // broken (e.g. SW restarted and the audio port never recovered).
+      // startAudioCapture is an idempotent in-place restart.
+      startAudioCapture().catch(() => {});
+    } else if (tabFlowed && audioStatus.tabFlowDead) {
+      audioStatus.tabFlowDead = false;
+      audioStatus.tab = true; changed = true; // flow recovered
+      lastNoFlowNotifyAt = 0; // next failure notifies immediately
+    }
+    if (!micFlowed && audioStatus.mic && !audioStatus.micFlowDead) {
+      audioStatus.micFlowDead = true;
+      audioStatus.mic = false; changed = true;
+      if (mayNotify) {
+        lastNoFlowNotifyAt = now;
+        notifyUser('no_mic_audio', 'Microphone audio stopped flowing — your speech is not being analyzed.');
+      }
+    } else if (micFlowed && audioStatus.micFlowDead && !audioStatus.micReason) {
+      audioStatus.micFlowDead = false;
+      audioStatus.mic = true; changed = true; // flow recovered (not a permission issue)
+    }
+    if (changed) broadcastAudioStatus();
+  }
+  lastFlowCheck = { mic: audioStatus.micBytes, tab: audioStatus.tabBytes, at: now };
+}
 
 // Decode base64 PCM sent by the offscreen document over the runtime port.
 function base64ToUint8Array(b64: string): Uint8Array {
@@ -547,6 +684,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   await ready;
   if (alarm.name === HEARTBEAT_ALARM) {
     if (state !== CopilotState.ACTIVE) return;
+    checkAudioFlow(); // Phase D: detect dead audio paths while ACTIVE
     if (lastHeartbeatAt === 0) {
       // SW restarted: in-memory heartbeat is lost. Don't silently skip the
       // check (the old bug) — verify the offscreen document actually exists and
@@ -599,6 +737,9 @@ chrome.runtime.onConnect.addListener((port) => {
       const sourceTag = msg.source === 'mic' ? SOURCE_MIC : SOURCE_TAB;
       const audio = base64ToUint8Array(msg.data);
       if (audio.length === 0) return;
+      // Flow accounting for the audio-health watchdog
+      if (sourceTag === SOURCE_MIC) audioStatus.micBytes += audio.length;
+      else audioStatus.tabBytes += audio.length;
       const tagged = new Uint8Array(1 + audio.length);
       tagged[0] = sourceTag;
       tagged.set(audio, 1);

@@ -34,7 +34,24 @@ const els = {
   storeNudges: $<HTMLInputElement>('store-nudges'),
   retentionDays: $<HTMLInputElement>('retention-days'),
   prefsStatus: $('prefs-status'),
+  audioHealthLine: $('audio-health-line'),
 };
+
+// Render the audio-health line in the active panel. A dead mic or missing
+// meeting audio is actionable (click to fix), not a silent failure.
+function renderAudioHealth(s: { mic?: boolean; tab?: boolean; playback?: boolean; micReason?: string }): void {
+  const parts: string[] = [];
+  parts.push(s.mic ? '🎙 Mic ✓' : '🎙 Mic ✗');
+  parts.push(s.tab ? '🔊 Meeting ✓' : '🔊 Meeting ✗');
+  if (s.playback === false) parts.push('⚠ audio paused');
+  els.audioHealthLine.textContent = parts.join('   ');
+  els.audioHealthLine.style.color = (s.mic && s.tab && s.playback !== false) ? '#059669' : '#dc2626';
+  els.audioHealthLine.style.cursor = s.mic ? 'default' : 'pointer';
+  els.audioHealthLine.title = s.mic ? '' : 'Click to grant microphone access';
+  els.audioHealthLine.onclick = s.mic ? null : () => {
+    sendMessage({ type: MessageType.OPEN_CONSENT_PAGE });
+  };
+}
 
 let isLoginMode = true;
 let preferences: Preferences | null = null;
@@ -252,6 +269,13 @@ function renderState(s: CopilotStateSnapshot): void {
     els.idlePanel.classList.add('hidden');
     els.activePanel.classList.remove('hidden');
     els.prospectDisplay.textContent = `Assisting: ${s.prospectEmail || ''}`;
+    // Pull the current audio-health snapshot for the indicators
+    if (s.state === CopilotState.ACTIVE) {
+      sendMessage({ type: MessageType.GET_AUDIO_STATUS }).then((res) => {
+        const data = (res as { data?: { mic?: boolean; tab?: boolean; playback?: boolean } })?.data;
+        if (data) renderAudioHealth(data);
+      }).catch(() => {});
+    }
 
     // Status bar
     els.statusBar.className = 'status-bar';
@@ -269,8 +293,11 @@ function renderState(s: CopilotStateSnapshot): void {
 }
 
 // Listen for state broadcasts from SW
-chrome.runtime.onMessage.addListener((msg: { type?: string } & CopilotStateSnapshot) => {
+chrome.runtime.onMessage.addListener((msg: { type?: string } & CopilotStateSnapshot & {
+  mic?: boolean; tab?: boolean; playback?: boolean; micReason?: string;
+}) => {
   if (msg.type === MessageType.STATE_UPDATE) renderState(msg);
+  else if (msg.type === MessageType.AUDIO_STATUS) renderAudioHealth(msg);
 });
 
 init();

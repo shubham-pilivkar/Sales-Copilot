@@ -2,7 +2,8 @@
 <html>
 <head><title>Sales Copilot Audio</title></head>
 <body>
-  <audio id="tab-monitor" autoplay></audio>
+  <!-- Playback is routed through the AudioContext (official tabCapture pattern);
+       no <audio> element needed. -->
   <script src="offscreen.ts" type="module"></script>
 </body>
 </html>

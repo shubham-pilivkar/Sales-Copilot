@@ -23,14 +23,14 @@ function setError(message: string): void {
  * extension origin and the offscreen document (same origin) can then use the
  * mic. Tracks are released immediately; the offscreen reopens its own.
  */
-async function requestMicPermission(): Promise<boolean> {
+async function requestMicPermission(): Promise<{ ok: boolean; reason?: string }> {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     stream.getTracks().forEach((t) => t.stop());
-    return true;
+    return { ok: true };
   } catch (err) {
     console.warn('[Consent] Microphone permission not granted:', err);
-    return false;
+    return { ok: false, reason: err instanceof Error ? err.name : 'Error' };
   }
 }
 
@@ -69,12 +69,18 @@ allowBtn.addEventListener('click', async () => {
   allowBtn.textContent = 'Requesting mic...';
 
   // Trigger the native mic prompt here; the offscreen document can't.
-  const micGranted = await requestMicPermission();
-  if (!micGranted) {
+  const mic = await requestMicPermission();
+  if (!mic.ok) {
     // Denial is non-fatal — pause so the user can read this, then let them
     // continue in tab-only mode (or grant mic via site settings and retry).
+    // Distinguish "no device" from "blocked" — telling a mic-less user to
+    // change site settings would be misleading.
     micWarned = true;
-    setError('Microphone access was blocked, so only participant (tab) audio will be captured. To include your voice, allow the microphone via the address-bar site settings, then reopen this. Otherwise, click again to continue without your mic.');
+    if (mic.reason === 'NotFoundError') {
+      setError('No microphone was found, so only participant (tab) audio will be captured. Connect a microphone and reopen this, or click again to continue without your mic.');
+    } else {
+      setError('Microphone access was blocked, so only participant (tab) audio will be captured. To include your voice: click the lock/tune icon in this window’s address bar → Site settings → Microphone → Allow, then reopen this. Otherwise, click again to continue without your mic.');
+    }
     allowBtn.disabled = false;
     denyBtn.disabled = false;
     allowBtn.textContent = 'Continue without microphone';

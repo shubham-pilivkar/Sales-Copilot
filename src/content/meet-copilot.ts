@@ -372,6 +372,19 @@ function createOverlay(): void {
       .empty { text-align: center; padding: 24px; color: #9ca3af; font-size: 12px; }
       .talk-ratio { padding: 8px 14px; border-top: 1px solid #f3f4f6; font-size: 11px; color: #6b7280; display: flex; justify-content: space-between; }
       .talk-ratio .warn { color: #dc2626; font-weight: 500; }
+      /* Audio health bar — surfaces dead mic / muted playback instead of a
+         silently broken session */
+      .audio-health { padding: 6px 14px; border-top: 1px solid #f3f4f6; font-size: 11px;
+        display: flex; align-items: center; gap: 10px; color: #6b7280; }
+      .audio-health .ind { display: inline-flex; align-items: center; gap: 4px; }
+      .audio-health .ok { color: #059669; }
+      .audio-health .bad { color: #dc2626; cursor: pointer; text-decoration: underline; }
+      .audio-banner { display: none; padding: 8px 14px; background: #fef3c7; color: #92400e;
+        font-size: 12px; align-items: center; justify-content: space-between; gap: 8px; }
+      .audio-banner.visible { display: flex; }
+      .audio-banner button { background: #d97706; color: #fff; border: none; border-radius: 6px;
+        padding: 5px 10px; font-size: 11px; cursor: pointer; white-space: nowrap; }
+      .audio-banner button:hover { background: #b45309; }
       @keyframes slideIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
     </style>
     <!-- G1: Minimized pill -->
@@ -396,12 +409,22 @@ function createOverlay(): void {
       </div>
       <!-- G5: Prospect brief -->
       <div class="prospect-brief" id="prospect-brief"></div>
+      <!-- Audio action banner (e.g. playback suspended → user click resumes) -->
+      <div class="audio-banner" id="audio-banner">
+        <span id="audio-banner-text">Meeting audio is paused.</span>
+        <button id="audio-banner-btn">Enable audio</button>
+      </div>
       <div class="nudges" id="nudge-list">
         <div class="empty">Analyzing conversation...</div>
       </div>
       <div class="talk-ratio" id="talk-ratio" style="display:none">
         <span id="ratio-text">Talk ratio: —</span>
         <span id="stage-text">Opening</span>
+      </div>
+      <!-- Audio health indicators -->
+      <div class="audio-health" id="audio-health" style="display:none">
+        <span class="ind" id="mic-ind">🎙 Mic: —</span>
+        <span class="ind" id="tab-ind">🔊 Meeting: —</span>
       </div>
       <div class="resize-handle" id="resize-handle" title="Drag to resize"></div>
     </div>
@@ -423,6 +446,14 @@ function createOverlay(): void {
   // G1: Minimize/expand handlers
   root.getElementById('minimize-btn')?.addEventListener('click', () => toggleMinimize(true));
   root.getElementById('copilot-pill')?.addEventListener('click', () => toggleMinimize(false));
+
+  // Audio action banner: this click is the user gesture that the invisible
+  // offscreen document can never receive — relay it to retry ctx.resume().
+  root.getElementById('audio-banner-btn')?.addEventListener('click', () => {
+    sendMessage({ type: MessageType.RESUME_AUDIO_PLAYBACK });
+    const banner = root.getElementById('audio-banner');
+    if (banner) banner.classList.remove('visible'); // hide; re-shown if still suspended
+  });
 
   // G2: Keyboard shortcut — Esc to dismiss top nudge. Store the handler so
   // removeOverlay can detach it; otherwise each create/remove cycle stacks
@@ -696,6 +727,37 @@ function escapeHtml(s: string): string {
   return div.innerHTML;
 }
 
+// Render the audio-health bar: dead mic / missing meeting audio / suspended
+// playback must be visible and actionable, not a silently broken session.
+function renderAudioStatus(s: { mic?: boolean; tab?: boolean; playback?: boolean; micReason?: string }): void {
+  const root = shadowRoot;
+  if (!root) return;
+  const bar = root.getElementById('audio-health');
+  const micInd = root.getElementById('mic-ind');
+  const tabInd = root.getElementById('tab-ind');
+  if (!bar || !micInd || !tabInd) return;
+  bar.style.display = 'flex';
+
+  if (s.mic) {
+    micInd.textContent = '🎙 Mic: capturing';
+    micInd.className = 'ind ok';
+    micInd.onclick = null;
+  } else {
+    micInd.textContent = s.micReason === 'denied'
+      ? '🎙 Mic blocked — click to fix'
+      : '🎙 Mic off — click to enable';
+    micInd.className = 'ind bad';
+    micInd.onclick = () => sendMessage({ type: MessageType.OPEN_CONSENT_PAGE });
+  }
+
+  tabInd.textContent = s.tab ? '🔊 Meeting: capturing' : '🔊 Meeting: no audio';
+  tabInd.className = 'ind ' + (s.tab ? 'ok' : 'bad');
+
+  // Suspended playback → show the clickable enable-audio banner
+  const banner = root.getElementById('audio-banner');
+  if (banner) banner.classList.toggle('visible', s.playback === false);
+}
+
 // Render the end-of-meeting summary as a persistent card in the overlay so the
 // backend's generated summary is actually surfaced to the rep.
 function showMeetingSummary(summary: MeetingSummary): void {
@@ -765,6 +827,9 @@ onMessage({
   },
   MEETING_SUMMARY: (msg) => {
     if (msg.summary) showMeetingSummary(msg.summary);
+  },
+  [MessageType.AUDIO_STATUS]: (msg) => {
+    renderAudioStatus(msg);
   },
   [MessageType.COPILOT_NOTICE]: (msg) => {
     // Non-fatal user-facing notice (e.g. autoplay blocked, capture failed).

@@ -65,12 +65,32 @@ export type NudgeActedMsg = { type: 'NUDGE_ACTED'; nudge_id: string; nudge_type:
 export type MicMuteStateMsg = { type: 'MIC_MUTE_STATE'; muted: boolean };
 
 // --- Offscreen ↔ SW ---
-export type OffscreenReadyMsg = { type: 'OFFSCREEN_READY' };
+/** Snapshot of the offscreen audio graph health, piggybacked on heartbeats. */
+export interface OffscreenAudioState {
+  contextState: string;
+  mic: boolean;
+  tab: boolean;
+}
+export type OffscreenReadyMsg = { type: 'OFFSCREEN_READY'; audio?: OffscreenAudioState };
 export type OffscreenStartCaptureMsg = { type: 'OFFSCREEN_START_CAPTURE'; streamId: string; tabId: number };
 export type OffscreenStopCaptureMsg = { type: 'OFFSCREEN_STOP_CAPTURE' };
 export type OffscreenAudioLevelMsg = { type: 'OFFSCREEN_AUDIO_LEVEL'; level: number };
 export type OffscreenCaptureFailedMsg = { type: 'OFFSCREEN_CAPTURE_FAILED'; error: string };
 export type MonitorBlockedMsg = { type: 'MONITOR_BLOCKED' };
+
+// --- Audio health (offscreen → SW → content/popup) ---
+export type MicUnavailableMsg = { type: 'MIC_UNAVAILABLE'; reason?: string };
+export type AudioPlaybackSuspendedMsg = { type: 'AUDIO_PLAYBACK_SUSPENDED' };
+export type ResumeAudioPlaybackMsg = { type: 'RESUME_AUDIO_PLAYBACK' };
+export type AudioStatusMsg = {
+  type: 'AUDIO_STATUS';
+  mic: boolean;
+  tab: boolean;
+  playback: boolean;
+  micReason?: string;
+};
+export type GetAudioStatusMsg = { type: 'GET_AUDIO_STATUS' };
+export type OpenConsentPageMsg = { type: 'OPEN_CONSENT_PAGE' };
 
 /** Every message that flows over chrome runtime messaging. */
 export type ExtMessage =
@@ -105,7 +125,13 @@ export type ExtMessage =
   | OffscreenStopCaptureMsg
   | OffscreenAudioLevelMsg
   | OffscreenCaptureFailedMsg
-  | MonitorBlockedMsg;
+  | MonitorBlockedMsg
+  | MicUnavailableMsg
+  | AudioPlaybackSuspendedMsg
+  | ResumeAudioPlaybackMsg
+  | AudioStatusMsg
+  | GetAudioStatusMsg
+  | OpenConsentPageMsg;
 
 /** All valid message discriminants. */
 export type ExtMessageType = ExtMessage['type'];

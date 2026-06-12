@@ -205,9 +205,9 @@ async function reconnectWS(): Promise<void> {
 // --- Offscreen Management ---
 
 async function ensureOffscreen(): Promise<void> {
+  const existing = await chrome.offscreen.hasDocument().catch(() => false);
+  if (existing) return;
   try {
-    const existing = await chrome.offscreen.hasDocument().catch(() => false);
-    if (existing) return;
     await chrome.offscreen.createDocument({
       url: 'src/offscreen/offscreen.html',
       // AUDIO_PLAYBACK: the offscreen doc also plays the captured tab audio
@@ -216,7 +216,21 @@ async function ensureOffscreen(): Promise<void> {
       justification: 'Capture meeting audio for AI sales copilot and keep it audible to the user',
     });
   } catch (err) {
-    console.error('[SW] ensureOffscreen failed:', err);
+    // Defensive: if this Chrome rejects the dual-reason form, retry with the
+    // single reason that always worked. A swallowed failure here would mean NO
+    // offscreen document → zero audio with no visible error.
+    console.warn('[SW] createDocument(dual reasons) failed, retrying USER_MEDIA only:', err);
+    try {
+      await chrome.offscreen.createDocument({
+        url: 'src/offscreen/offscreen.html',
+        reasons: [chrome.offscreen.Reason.USER_MEDIA],
+        justification: 'Capture meeting audio for AI sales copilot',
+      });
+    } catch (err2) {
+      console.error('[SW] ensureOffscreen failed:', err2);
+      notifyUser('offscreen_failed', 'Audio capture could not start — try stopping and starting the assistant.');
+      throw err2; // surface to startAudioCapture's catch — don't pretend success
+    }
   }
 }
 

@@ -128,6 +128,57 @@ async function resumePlayback(): Promise<void> {
   }
 }
 
+/** Acquire the tab-capture stream without ever hard-failing on constraint
+ *  support differences across Chrome versions.
+ *  Attempt 1: legacy-only syntax with goog* processing disables.
+ *  Attempt 2 (fallback): bare legacy constraints — the known-working baseline.
+ *  Finally: best-effort applyConstraints() for the standard processing keys
+ *  (modern API on the live track — no legacy/modern mixing). */
+async function acquireTabStream(streamId: string): Promise<MediaStream> {
+  const legacyWithDisables = {
+    audio: {
+      mandatory: {
+        chromeMediaSource: 'tab',
+        chromeMediaSourceId: streamId,
+        googEchoCancellation: false,
+        googAutoGainControl: false,
+        googNoiseSuppression: false,
+        googHighpassFilter: false,
+      },
+    },
+  } as unknown as MediaStreamConstraints;
+  const legacyBare = {
+    audio: {
+      mandatory: {
+        chromeMediaSource: 'tab',
+        chromeMediaSourceId: streamId,
+      },
+    },
+  } as unknown as MediaStreamConstraints;
+
+  let tab: MediaStream;
+  try {
+    tab = await navigator.mediaDevices.getUserMedia(legacyWithDisables);
+    console.info('[Offscreen] Tab captured with goog* processing disables');
+  } catch (err) {
+    console.warn('[Offscreen] goog* constraints rejected — falling back to bare capture:', err);
+    tab = await navigator.mediaDevices.getUserMedia(legacyBare);
+  }
+
+  // Best-effort: disable processing via the modern per-track API. Harmless if
+  // the track/browser rejects it — quality improves when it sticks.
+  for (const track of tab.getAudioTracks()) {
+    try {
+      await track.applyConstraints({
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      } as MediaTrackConstraints);
+    } catch { /* not supported for this track — keep capturing regardless */ }
+  }
+  return tab;
+}
+
 async function startCapture(streamId: string): Promise<void> {
   // Idempotent: tear down any existing graph/port first so a re-trigger
   // (heartbeat restart, port reconnect) never stacks a second pipeline.
@@ -140,31 +191,19 @@ async function startCapture(streamId: string): Promise<void> {
     // 1. Capture tab audio (participants). The chromeMediaSource/mandatory
     //    constraint is a legacy Chrome API not in the standard TS types.
     //
-    // CRITICAL: disable ALL WebRTC voice processing on the tab capture. The
-    // meeting audio is program audio, not a microphone:
-    //  - noiseSuppression mangles overlapping speakers (major degradation in
-    //    multi-participant calls),
-    //  - autoGainControl causes volume pumping,
-    //  - echoCancellation treats our own playback of this stream as "echo"
-    //    and progressively cancels the meeting audio toward silence.
-    // Both the legacy goog* mandatory flags and the standard constraints are
-    // set — Chrome versions differ in which they honor for tab capture.
-    const tabConstraints = {
-      audio: {
-        mandatory: {
-          chromeMediaSource: 'tab',
-          chromeMediaSourceId: streamId,
-          googEchoCancellation: false,
-          googAutoGainControl: false,
-          googNoiseSuppression: false,
-          googHighpassFilter: false,
-        },
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
-    } as unknown as MediaStreamConstraints;
-    const tab = await navigator.mediaDevices.getUserMedia(tabConstraints);
+    // We want ALL WebRTC voice processing disabled on the tab capture — the
+    // meeting audio is program audio, not a microphone (noiseSuppression
+    // mangles overlapping speakers, autoGainControl pumps, echoCancellation
+    // cancels our own playback of this stream toward silence).
+    //
+    // IMPORTANT (regression fix): legacy `mandatory` syntax must NEVER be mixed
+    // with modern constraint keys in the same object — Chrome rejects that with
+    // "Malformed constraint: Cannot use both optional/mandatory and specific or
+    // advanced constraints", which killed the entire capture (zero audio).
+    // Strategy: try legacy-only with goog* disables; fall back to the bare
+    // constraints that are guaranteed to work; then best-effort
+    // applyConstraints() on the live track for the standard properties.
+    const tab = await acquireTabStream(streamId);
     if (stale()) { tab.getTracks().forEach((t) => t.stop()); return; }
     tabStream = tab;
     // NOTE: tab playback is wired later via the Web Audio graph

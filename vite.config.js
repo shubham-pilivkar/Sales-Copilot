@@ -8,6 +8,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         offscreen: 'src/offscreen/offscreen.html',
+        consent: 'src/permission/consent.html',
       },
       output: {
         entryFileNames: 'assets/[name].js',

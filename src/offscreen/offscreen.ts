@@ -167,6 +167,12 @@ async function startCapture(streamId: string): Promise<void> {
     const tab = await navigator.mediaDevices.getUserMedia(tabConstraints);
     if (stale()) { tab.getTracks().forEach((t) => t.stop()); return; }
     tabStream = tab;
+    // NOTE: tab playback is wired later via the Web Audio graph
+    // (tabSource → ctx.destination). We deliberately do NOT clone the tab
+    // stream into a separate <audio> element — cloning a tabCapture stream is a
+    // known Chrome issue that silently breaks the capture tap (the worklet goes
+    // silent) or breaks playback. The official pattern feeds ONE
+    // MediaStreamSource into both the destination and the worklet.
 
     // 2. Capture mic (user's voice). Echo cancellation must stay ON here: the
     //    meeting audio plays from the user's speakers and would otherwise be

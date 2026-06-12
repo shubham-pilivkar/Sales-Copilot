@@ -3,6 +3,7 @@
 import { MessageType } from '../constants.js';
 import { sendMessage, onMessage } from '../lib/messaging.js';
 import type { Nudge, ProspectProfile, MeetingSummary } from '../types/ws.js';
+import type { CopilotStateSnapshot } from '../types/messages.js';
 
 // --- Build Stamp (#9) ---
 const BUILD_STAMP = Date.now().toString(36);
@@ -41,6 +42,8 @@ function checkMeeting(): void {
     meetLeaveTicks = 0;
     startEndDetection();
     sendMessage({ type: MessageType.MEETING_DETECTED, tabId: null });
+    // A session may already be active for this tab — re-sync so the panel shows.
+    syncCopilotState();
   } else if (!inMeeting && meetingDetected && !meetingEndedFired) {
     checkMeetEnded();
   }
@@ -48,6 +51,22 @@ function checkMeeting(): void {
 
 setInterval(checkMeeting, 2000);
 checkMeeting();
+
+// On (re)load the content script has no overlay, but a session may already be
+// running in the service worker (e.g. the Meet page was refreshed mid-call).
+// Ask the SW for the current state and bring the panel back if so — otherwise
+// we'd miss the already-fired lifecycle message and show nothing.
+async function syncCopilotState(): Promise<void> {
+  const res = await sendMessage<CopilotStateSnapshot>({ type: MessageType.GET_STATE });
+  if (!res.ok || !res.data) return;
+  const s = res.data.state;
+  if (s === 'CONNECTING' || s === 'ACTIVE' || s === 'RECONNECTING') {
+    copilotActive = true;
+    createOverlay();
+    updateStatus(s === 'ACTIVE' ? 'Active' : s === 'RECONNECTING' ? 'Reconnecting...' : 'Connecting...');
+  }
+}
+syncCopilotState();
 
 // --- Meeting End Detection (#1 URL + #2 Multi-locale + #3 DOM debounced) ---
 
@@ -276,13 +295,21 @@ function createOverlay(): void {
       :host { all: initial; }
       * { box-sizing: border-box; }
       .panel {
-        position: fixed; bottom: 80px; right: 16px; width: 360px; max-height: 480px;
+        position: fixed; bottom: 80px; right: 16px; width: 360px; height: 480px;
+        min-width: 280px; min-height: 220px;
         background: #fff; border-radius: 12px;
         box-shadow: 0 8px 32px rgba(0,0,0,0.12);
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
         font-size: 13px; color: #1a1a2e; z-index: 2147483647;
         display: flex; flex-direction: column; overflow: hidden;
-        border: 1px solid #e5e7eb; transition: all 0.3s ease;
+        border: 1px solid #e5e7eb;
+      }
+      /* Resize grip (bottom-right corner) */
+      .resize-handle {
+        position: absolute; right: 0; bottom: 0; width: 18px; height: 18px;
+        cursor: nwse-resize; z-index: 2; touch-action: none;
+        background:
+          linear-gradient(135deg, transparent 0 50%, #9ca3af 50% 60%, transparent 60% 70%, #9ca3af 70% 80%, transparent 80%);
       }
       .panel.minimized { display: none; }
       /* G1: Minimized pill */
@@ -304,6 +331,7 @@ function createOverlay(): void {
         padding: 10px 14px; background: #6366f1; color: #fff;
         font-weight: 600; font-size: 12px;
         display: flex; justify-content: space-between; align-items: center;
+        cursor: move; user-select: none; touch-action: none;
       }
       .header-left { display: flex; align-items: center; gap: 6px; }
       .header .status { font-weight: 400; opacity: 0.85; font-size: 11px; }
@@ -322,7 +350,7 @@ function createOverlay(): void {
       .nudges {
         flex: 1; overflow-y: auto; padding: 8px;
         display: flex; flex-direction: column; gap: 8px;
-        max-height: 320px; scroll-behavior: smooth;
+        scroll-behavior: smooth;
       }
       .nudge-card {
         padding: 10px 12px; border-radius: 8px;
@@ -398,11 +426,22 @@ function createOverlay(): void {
         <span class="ind" id="mic-ind">🎙 Mic: —</span>
         <span class="ind" id="tab-ind">🔊 Meeting: —</span>
       </div>
+      <div class="resize-handle" id="resize-handle" title="Drag to resize"></div>
     </div>
   `;
 
   nudgeContainer = root.getElementById('nudge-list');
   document.body.appendChild(host);
+
+  // Draggable (via header) + resizable (via corner grip), with persisted geometry
+  const panel = root.getElementById('copilot-panel') as HTMLElement | null;
+  const header = root.querySelector('.header') as HTMLElement | null;
+  const resizeHandle = root.getElementById('resize-handle') as HTMLElement | null;
+  if (panel) {
+    restorePanelGeometry(panel);
+    if (header) setupDrag(panel, header);
+    if (resizeHandle) setupResize(panel, resizeHandle);
+  }
 
   // G1: Minimize/expand handlers
   root.getElementById('minimize-btn')?.addEventListener('click', () => toggleMinimize(true));
@@ -427,6 +466,99 @@ function createOverlay(): void {
     }
   };
   document.addEventListener('keydown', keydownHandler);
+}
+
+// --- Drag + Resize ---
+const PANEL_MIN_W = 280;
+const PANEL_MIN_H = 220;
+const GEOMETRY_KEY = 'sc_panel_geometry';
+
+// Switch the panel from its default bottom/right anchoring to explicit top/left
+// so it can be moved and grown deterministically from the top-left corner.
+function pinTopLeft(panel: HTMLElement): void {
+  const rect = panel.getBoundingClientRect();
+  panel.style.left = `${rect.left}px`;
+  panel.style.top = `${rect.top}px`;
+  panel.style.right = 'auto';
+  panel.style.bottom = 'auto';
+}
+
+function savePanelGeometry(panel: HTMLElement): void {
+  const g = { left: panel.style.left, top: panel.style.top, width: panel.style.width, height: panel.style.height };
+  chrome.storage.local.set({ [GEOMETRY_KEY]: g }).catch(() => {});
+}
+
+function restorePanelGeometry(panel: HTMLElement): void {
+  chrome.storage.local.get(GEOMETRY_KEY).then((res) => {
+    const g = res[GEOMETRY_KEY] as { left?: string; top?: string; width?: string; height?: string } | undefined;
+    if (!g) return;
+    if (g.width) panel.style.width = g.width;
+    if (g.height) panel.style.height = g.height;
+    if (g.left && g.top) {
+      // Clamp into the current viewport in case the window is smaller now.
+      const w = parseInt(g.width || '360', 10);
+      const h = parseInt(g.height || '480', 10);
+      const left = Math.max(0, Math.min(parseInt(g.left, 10) || 0, window.innerWidth - w));
+      const top = Math.max(0, Math.min(parseInt(g.top, 10) || 0, window.innerHeight - h));
+      panel.style.left = `${left}px`;
+      panel.style.top = `${top}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+    }
+  }).catch(() => {});
+}
+
+function setupDrag(panel: HTMLElement, handle: HTMLElement): void {
+  handle.addEventListener('pointerdown', (e: PointerEvent) => {
+    // Let header buttons (minimize) keep working — don't start a drag on them.
+    if ((e.target as HTMLElement).closest('button')) return;
+    e.preventDefault();
+    pinTopLeft(panel);
+    const rect = panel.getBoundingClientRect();
+    const offsetX = e.clientX - rect.left;
+    const offsetY = e.clientY - rect.top;
+    handle.setPointerCapture(e.pointerId);
+    const onMove = (ev: PointerEvent): void => {
+      const left = Math.max(0, Math.min(ev.clientX - offsetX, window.innerWidth - panel.offsetWidth));
+      const top = Math.max(0, Math.min(ev.clientY - offsetY, window.innerHeight - panel.offsetHeight));
+      panel.style.left = `${left}px`;
+      panel.style.top = `${top}px`;
+    };
+    const onUp = (ev: PointerEvent): void => {
+      handle.releasePointerCapture(ev.pointerId);
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+      savePanelGeometry(panel);
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+  });
+}
+
+function setupResize(panel: HTMLElement, handle: HTMLElement): void {
+  handle.addEventListener('pointerdown', (e: PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    pinTopLeft(panel);
+    const rect = panel.getBoundingClientRect();
+    const startX = e.clientX, startY = e.clientY;
+    const startW = rect.width, startH = rect.height;
+    handle.setPointerCapture(e.pointerId);
+    const onMove = (ev: PointerEvent): void => {
+      const w = Math.max(PANEL_MIN_W, Math.min(startW + (ev.clientX - startX), window.innerWidth - rect.left));
+      const h = Math.max(PANEL_MIN_H, Math.min(startH + (ev.clientY - startY), window.innerHeight - rect.top));
+      panel.style.width = `${w}px`;
+      panel.style.height = `${h}px`;
+    };
+    const onUp = (ev: PointerEvent): void => {
+      handle.releasePointerCapture(ev.pointerId);
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+      savePanelGeometry(panel);
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+  });
 }
 
 // G1: Toggle minimize
@@ -704,9 +836,17 @@ onMessage({
     if (msg.message) updateStatus(msg.message);
   },
   [MessageType.STATE_UPDATE]: (msg) => {
+    // Bring the panel back if a broadcast arrives while we have no overlay
+    // (e.g. the content script reloaded mid-session).
+    if (!shadowHost && (msg.state === 'ACTIVE' || msg.state === 'CONNECTING' || msg.state === 'RECONNECTING')) {
+      copilotActive = true;
+      createOverlay();
+    }
     if (msg.state === 'ACTIVE') {
       updateStatus('Active');
       showOfflineBanner(false);
+    } else if (msg.state === 'CONNECTING') {
+      updateStatus('Connecting...');
     } else if (msg.state === 'RECONNECTING') {
       updateStatus('Reconnecting...');
     } else if (msg.state === 'ERROR') {
